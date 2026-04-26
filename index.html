@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#f4ede0" />
+
+    <!-- iOS "add to home screen" config -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Knatte Coach" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <title>Knatte Coach</title>
+
+    <!-- Tailwind via CDN: simple, no build config needed -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+      html, body { background: #f4ede0; }
+      body {
+        margin: 0;
+        -webkit-font-smoothing: antialiased;
+        -webkit-touch-callout: none;
+        overscroll-behavior-y: none;
+      }
+      #root { min-height: 100dvh; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
