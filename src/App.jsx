@@ -788,7 +788,7 @@ export default function FootballCoachApp() {
       ...consolidated,
       clockSeconds: Math.max(0, (consolidated.clockSeconds || 0) + delta),
     };
-  });
+  }); // eslint-disable-line no-unused-vars
 
   const goNextHalf = () => updateActiveMatch(m => {
     // Consolidate so the half's playing time is preserved before resetting clock.
@@ -1502,16 +1502,35 @@ function MatchSetupView({ match, roster, coaches, existingNames, onCancel, onSav
 
       {/* Half length */}
       <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
-        <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Halvlekstid</label>
-        <div className="grid grid-cols-5 gap-1.5">
-          {[15, 20, 25, 30, 45].map(min => (
+        <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Halvlekstid (minuter)</label>
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={99}
+            value={halfMinutes}
+            onChange={e => {
+              const v = e.target.value;
+              if (v === '') { setHalfMinutes(''); return; }
+              const n = parseInt(v, 10);
+              if (!isNaN(n)) setHalfMinutes(Math.max(1, Math.min(99, n)));
+            }}
+            onBlur={() => { if (!halfMinutes || halfMinutes < 1) setHalfMinutes(1); }}
+            className="w-20 px-3 py-2.5 rounded-lg display text-lg tabular text-center font-bold outline-none"
+            style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+          />
+          <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>min per halvlek</span>
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-2.5">
+          {[10, 12, 15, 20, 24, 25, 30, 45].map(min => (
             <button
               key={min}
               onClick={() => setHalfMinutes(min)}
-              className="py-2.5 rounded-lg text-xs font-bold tabular"
+              className="px-2.5 py-1 rounded-md text-[11px] font-semibold tabular"
               style={{
                 background: halfMinutes === min ? 'var(--ink)' : 'transparent',
-                color: halfMinutes === min ? 'var(--bg)' : 'var(--ink)',
+                color: halfMinutes === min ? 'var(--bg)' : 'var(--ink-muted)',
                 border: `1px solid ${halfMinutes === min ? 'var(--ink)' : 'var(--border-strong)'}`,
               }}
             >
@@ -1671,7 +1690,7 @@ function MatchSetupView({ match, roster, coaches, existingNames, onCancel, onSav
             venue: venue.trim(),
             format,
             formationName,
-            halfMinutes,
+            halfMinutes: Math.max(1, Math.min(99, parseInt(halfMinutes, 10) || formatDef.halfMinutes)),
             squad,
             coaches: matchCoaches,
           })}
@@ -1800,29 +1819,13 @@ function MatchView({
           </div>
         </div>
 
-        <div className="grid grid-cols-5 gap-1.5 mt-3">
-          <button
-            onClick={() => onAdjustClock(-30)}
-            className="py-2 rounded-lg text-[11px] font-semibold tabular"
-            style={{ background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}
-          >
-            −30s
-          </button>
-          <button
-            onClick={onToggleClock}
-            className="col-span-3 py-2.5 rounded-lg text-sm font-bold uppercase tracking-wider flex items-center justify-center gap-1.5"
-            style={{ background: match.clockRunning ? 'var(--ink)' : 'var(--accent)', color: match.clockRunning ? 'var(--bg)' : 'white' }}
-          >
-            {match.clockRunning ? <><Pause size={14} /> Paus</> : <><Play size={14} /> Start</>}
-          </button>
-          <button
-            onClick={() => onAdjustClock(30)}
-            className="py-2 rounded-lg text-[11px] font-semibold tabular"
-            style={{ background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}
-          >
-            +30s
-          </button>
-        </div>
+        <button
+          onClick={onToggleClock}
+          className="w-full mt-3 py-2.5 rounded-lg text-sm font-bold uppercase tracking-wider flex items-center justify-center gap-1.5"
+          style={{ background: match.clockRunning ? 'var(--ink)' : 'var(--accent)', color: match.clockRunning ? 'var(--bg)' : 'white' }}
+        >
+          {match.clockRunning ? <><Pause size={14} /> Paus</> : <><Play size={14} /> Start</>}
+        </button>
         <button
           onClick={onNextHalf}
           className="w-full mt-1.5 py-2 rounded-lg text-[11px] font-semibold uppercase tracking-wider"
@@ -2684,8 +2687,8 @@ function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
       )}
 
       <div className="text-center text-[10px] mt-8 leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
-        Knatte Coach · v0.4<br/>
-        Tränare, matchtid och plan
+        Knatte Coach · v0.5<br/>
+        Fri halvlekstid + förenklad klocka
       </div>
     </div>
   );
