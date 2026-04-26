@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Play, Pause, Plus, X, Trash2, Edit2, Settings as SettingsIcon,
   Users, BarChart3, Activity, RotateCcw, ArrowLeftRight, Award,
   AlertTriangle, ChevronDown, Square, Save, Goal as GoalIcon,
-  Clock, Hash, Check, ListChecks, Calendar, Copy, ChevronRight, ArrowLeft
+  Clock, Hash, Check, ListChecks, Calendar, Copy, ChevronRight, ArrowLeft,
+  Share2, Download, Upload, FileText
 } from 'lucide-react';
 
 // ===================================================================
@@ -415,6 +416,9 @@ export default function FootballCoachApp() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [editingMatchId, setEditingMatchId] = useState(null); // null | 'new' | matchId
   const [confirmDeleteMatchId, setConfirmDeleteMatchId] = useState(null);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [importModalState, setImportModalState] = useState(null); // null | { payload, fileName }
+  const [importMessage, setImportMessage] = useState(null); // { type: 'success'|'error', text }
 
   const activeMatch = useMemo(
     () => matches.find(m => m.id === activeMatchId) || null,
@@ -911,6 +915,123 @@ export default function FootballCoachApp() {
   const updateCoach = (id, updates) => setCoaches(c => c.map(x => x.id === id ? { ...x, ...updates } : x));
   const removeCoach = (id) => setCoaches(c => c.filter(x => x.id !== id));
 
+  // ============== EXPORT / IMPORT ==============
+
+  // Build export payload: roster + coaches always; matches selected by user.
+  const buildExportPayload = (matchIds) => {
+    const matchSet = new Set(matchIds);
+    const selectedMatches = matches.filter(m => matchSet.has(m.id))
+      // Don't share running clock state — it's meaningless on another device.
+      .map(m => ({ ...m, clockRunning: false, clockEpochAt: null }));
+    return {
+      app: 'knatte-coach',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      roster,
+      coaches,
+      matches: selectedMatches,
+    };
+  };
+
+  // Trigger native share sheet (or download fallback on desktop).
+  const shareExport = async (matchIds) => {
+    const payload = buildExportPayload(matchIds);
+    const json = JSON.stringify(payload, null, 2);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const fileName = `knatte-coach-${dateStr}.json`;
+    try {
+      const file = new File([json], fileName, { type: 'application/json' });
+      // Native share with file (iOS Safari supports this on iOS 15+).
+      if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Knatte Coach data' });
+        setShareModalOpen(false);
+        return;
+      }
+      // Fallback: text-only share (some Android browsers).
+      if (navigator.share) {
+        await navigator.share({ title: 'Knatte Coach data', text: json });
+        setShareModalOpen(false);
+        return;
+      }
+    } catch (e) {
+      // User cancelled, or share failed — fall through to download.
+      if (e?.name === 'AbortError') return;
+    }
+    // Final fallback: download as a file.
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setShareModalOpen(false);
+  };
+
+  // Read file the user picked, parse, validate, open the import modal.
+  const handleImportFile = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      if (payload?.app !== 'knatte-coach' || !Array.isArray(payload.roster)) {
+        throw new Error('Filen är inte en giltig Knatte Coach-export.');
+      }
+      // Normalize defaults
+      payload.coaches = Array.isArray(payload.coaches) ? payload.coaches : [];
+      payload.matches = Array.isArray(payload.matches) ? payload.matches : [];
+      setImportModalState({ payload, fileName: file.name });
+    } catch (e) {
+      setImportMessage({ type: 'error', text: 'Kunde inte läsa filen: ' + (e?.message || 'okänt fel') });
+    }
+  };
+
+  // Apply the import using the user's chosen mode: 'replace' or 'merge'.
+  const applyImport = (mode) => {
+    if (!importModalState) return;
+    const { payload } = importModalState;
+    if (mode === 'replace') {
+      setRoster(payload.roster);
+      setCoaches(payload.coaches);
+      // Pause any running match before swapping
+      const newMatches = payload.matches.map(m => ({
+        ...m, clockRunning: false, clockEpochAt: null,
+      }));
+      setMatches(newMatches);
+      setActiveMatchId(newMatches.length ? newMatches[0].id : null);
+      setImportMessage({
+        type: 'success',
+        text: `Ersatt allt: ${payload.roster.length} spelare, ${payload.coaches.length} tränare, ${payload.matches.length} match${payload.matches.length === 1 ? '' : 'er'}.`,
+      });
+    } else if (mode === 'merge') {
+      // Merge by id: incoming overrides existing for same id.
+      const mergeById = (current, incoming) => {
+        const map = new Map(current.map(x => [x.id, x]));
+        let added = 0;
+        incoming.forEach(x => {
+          if (!map.has(x.id)) added++;
+          map.set(x.id, x);
+        });
+        return { merged: Array.from(map.values()), added };
+      };
+      const r = mergeById(roster, payload.roster);
+      const c = mergeById(coaches, payload.coaches);
+      const m = mergeById(matches, payload.matches.map(x => ({
+        ...x, clockRunning: false, clockEpochAt: null,
+      })));
+      setRoster(r.merged);
+      setCoaches(c.merged);
+      setMatches(m.merged);
+      setImportMessage({
+        type: 'success',
+        text: `Importerat: ${r.added} nya spelare, ${c.added} nya tränare, ${m.added} nya match${m.added === 1 ? '' : 'er'} (befintliga med samma id uppdaterades).`,
+      });
+    }
+    setImportModalState(null);
+  };
+
   const playerById = useMemo(() => {
     const map = new Map();
     roster.forEach(p => map.set(p.id, p));
@@ -1054,7 +1175,16 @@ export default function FootballCoachApp() {
           />
         )}
         {view === 'settings' && (
-          <SettingsView settings={settings} onChange={setSettings} onAskReset={() => setConfirmReset(true)} hasActiveMatch={!!activeMatch} />
+          <SettingsView
+            settings={settings}
+            onChange={setSettings}
+            onAskReset={() => setConfirmReset(true)}
+            hasActiveMatch={!!activeMatch}
+            onShare={() => setShareModalOpen(true)}
+            onImport={handleImportFile}
+            importMessage={importMessage}
+            clearImportMessage={() => setImportMessage(null)}
+          />
         )}
       </div>
 
@@ -1094,6 +1224,24 @@ export default function FootballCoachApp() {
           confirmLabel="Ja, återställ"
           onConfirm={resetActiveMatch}
           onCancel={() => setConfirmReset(false)}
+        />
+      )}
+      {shareModalOpen && (
+        <ShareModal
+          matches={matches}
+          settings={settings}
+          roster={roster}
+          coaches={coaches}
+          onShare={shareExport}
+          onClose={() => setShareModalOpen(false)}
+        />
+      )}
+      {importModalState && (
+        <ImportModal
+          payload={importModalState.payload}
+          fileName={importModalState.fileName}
+          onApply={applyImport}
+          onCancel={() => setImportModalState(null)}
         />
       )}
     </div>
@@ -2646,8 +2794,10 @@ function PlayerForm({ initial, onSave, onCancel, onRemove }) {
 // SETTINGS VIEW
 // ===================================================================
 
-function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
+function SettingsView({ settings, onChange, onAskReset, hasActiveMatch, onShare, onImport, importMessage, clearImportMessage }) {
   const set = (k, v) => onChange({ ...settings, [k]: v });
+  const fileInputRef = useRef(null);
+
   return (
     <div className="px-4 pt-5">
       <h1 className="display text-3xl font-bold mb-5">Inställningar</h1>
@@ -2676,6 +2826,58 @@ function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
         </div>
       </div>
 
+      {/* Share / Import */}
+      <div className="rounded-2xl p-4 mb-4" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: 'var(--ink-faint)' }}>
+          Dela & importera
+        </div>
+        <div className="text-[11px] mb-3" style={{ color: 'var(--ink-muted)' }}>
+          Trupp och tränare följer alltid med. Matcher väljer du själv.
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={onShare}
+            className="py-3 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5"
+            style={{ background: 'var(--ink)', color: 'var(--bg)' }}
+          >
+            <Share2 size={14} /> Dela
+          </button>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="py-3 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5"
+            style={{ background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--ink)' }}
+          >
+            <Upload size={14} /> Importera
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            onChange={e => {
+              const f = e.target.files?.[0];
+              if (f) onImport(f);
+              e.target.value = ''; // allow re-importing the same file
+            }}
+          />
+        </div>
+
+        {importMessage && (
+          <div className="mt-3 px-3 py-2 rounded-lg text-[11px] flex items-start gap-2"
+            style={{
+              background: importMessage.type === 'error' ? 'rgba(220, 38, 38, 0.08)' : 'rgba(46, 110, 63, 0.08)',
+              color: importMessage.type === 'error' ? '#b91c1c' : '#1f5530',
+              border: `1px solid ${importMessage.type === 'error' ? 'rgba(220, 38, 38, 0.25)' : 'rgba(46, 110, 63, 0.25)'}`,
+            }}>
+            <div className="flex-1">{importMessage.text}</div>
+            <button onClick={clearImportMessage} aria-label="Stäng" style={{ opacity: 0.6 }}>
+              <X size={12} />
+            </button>
+          </div>
+        )}
+      </div>
+
       {hasActiveMatch && (
         <button
           onClick={onAskReset}
@@ -2687,8 +2889,8 @@ function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
       )}
 
       <div className="text-center text-[10px] mt-8 leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
-        Knatte Coach · v0.5<br/>
-        Fri halvlekstid + förenklad klocka
+        Knatte Coach · v0.6<br/>
+        Dela & importera trupp + matcher
       </div>
     </div>
   );
@@ -2974,6 +3176,166 @@ function ConfirmModal({ title, message, confirmLabel, onConfirm, onCancel }) {
           {confirmLabel}
         </button>
       </div>
+    </ModalShell>
+  );
+}
+
+// Share modal: roster + coaches always; let the user pick which matches to include.
+function ShareModal({ matches, settings, roster, coaches, onShare, onClose }) {
+  // Sort matches the same way the matches list does.
+  const sorted = useMemo(() => {
+    const withTime = matches.filter(m => m.kickoffAt);
+    const withoutTime = matches.filter(m => !m.kickoffAt);
+    withTime.sort((a, b) => new Date(a.kickoffAt).getTime() - new Date(b.kickoffAt).getTime());
+    withoutTime.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return [...withTime, ...withoutTime];
+  }, [matches]);
+
+  // Default selection: nothing selected (user explicitly opts in).
+  const [selectedIds, setSelectedIds] = useState([]);
+  const selectedSet = new Set(selectedIds);
+  const toggle = (id) => setSelectedIds(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  const selectAll = () => setSelectedIds(matches.map(m => m.id));
+  const clearAll = () => setSelectedIds([]);
+
+  return (
+    <ModalShell title="Dela data" onClose={onClose}>
+      <div className="text-[12px] mb-4 px-3 py-2 rounded-lg" style={{ background: 'rgba(46,110,63,0.08)', color: 'var(--ink)', border: '1px solid rgba(46,110,63,0.2)' }}>
+        <div className="font-semibold mb-0.5">Följer alltid med:</div>
+        <div style={{ color: 'var(--ink-muted)' }}>
+          {roster.length} spelare · {coaches.length} tränare
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] uppercase tracking-[0.2em] font-bold" style={{ color: 'var(--ink-faint)' }}>
+          Välj matcher ({selectedIds.length}/{matches.length})
+        </div>
+        {matches.length > 0 && (
+          <div className="flex gap-1">
+            <button onClick={selectAll} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>Alla</button>
+            <button onClick={clearAll} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>Rensa</button>
+          </div>
+        )}
+      </div>
+
+      {matches.length === 0 ? (
+        <div className="text-xs text-center py-4 mb-4" style={{ color: 'var(--ink-muted)' }}>
+          Inga matcher att dela. Trupp och tränare delas ändå.
+        </div>
+      ) : (
+        <div className="space-y-1 mb-4 max-h-[40vh] overflow-y-auto scrollbar-thin">
+          {sorted.map(m => {
+            const inSel = selectedSet.has(m.id);
+            const opp = m.opponent || settings.awayTeam;
+            const kickoff = formatKickoff(m.kickoffAt);
+            return (
+              <button
+                key={m.id}
+                onClick={() => toggle(m.id)}
+                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left"
+                style={{
+                  background: inSel ? 'var(--accent-soft)' : 'white',
+                  border: `1.5px solid ${inSel ? 'var(--accent)' : 'var(--border)'}`,
+                }}
+              >
+                <div className="flex items-center justify-center rounded shrink-0" style={{
+                  width: 22, height: 22,
+                  background: inSel ? 'var(--accent)' : 'transparent',
+                  border: inSel ? 'none' : '1.5px solid var(--border-strong)',
+                }}>
+                  {inSel && <Check size={14} style={{ color: 'white' }} />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-semibold truncate" style={{ color: 'var(--ink)' }}>{m.name}</div>
+                  <div className="text-[11px] truncate" style={{ color: 'var(--ink-muted)' }}>
+                    vs {opp}{kickoff ? ` · ${kickoff}` : ''}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button onClick={onClose} className="flex-1 py-3 rounded-xl text-sm font-semibold"
+          style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}>
+          Avbryt
+        </button>
+        <button
+          onClick={() => onShare(selectedIds)}
+          className="flex-1 py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          <Share2 size={14} /> Dela
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+// Import modal: shows what's in the file and asks whether to replace or merge.
+function ImportModal({ payload, fileName, onApply, onCancel }) {
+  const stats = {
+    players: payload.roster.length,
+    coaches: payload.coaches.length,
+    matches: payload.matches.length,
+  };
+  return (
+    <ModalShell title="Importera data" onClose={onCancel}>
+      <div className="text-xs mb-3" style={{ color: 'var(--ink-muted)' }}>
+        Fil: <span className="font-semibold" style={{ color: 'var(--ink)' }}>{fileName}</span>
+      </div>
+
+      <div className="rounded-xl p-3 mb-4" style={{ background: 'white', border: '1px solid var(--border)' }}>
+        <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: 'var(--ink-faint)' }}>Innehåll</div>
+        <div className="grid grid-cols-3 gap-2 text-center">
+          <div>
+            <div className="display tabular text-2xl font-bold">{stats.players}</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>Spelare</div>
+          </div>
+          <div>
+            <div className="display tabular text-2xl font-bold">{stats.coaches}</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>Tränare</div>
+          </div>
+          <div>
+            <div className="display tabular text-2xl font-bold">{stats.matches}</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>Matcher</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: 'var(--ink-faint)' }}>
+        Hur ska din befintliga data hanteras?
+      </div>
+      <div className="space-y-2 mb-5">
+        <button
+          onClick={() => onApply('merge')}
+          className="w-full px-3 py-3 rounded-xl text-left"
+          style={{ background: 'var(--accent-soft)', border: '1.5px solid var(--accent)' }}
+        >
+          <div className="text-sm font-bold" style={{ color: 'var(--accent-strong)' }}>Slå ihop</div>
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-muted)' }}>
+            Lägg till nya spelare, tränare och matcher. Befintlig data behålls.
+          </div>
+        </button>
+        <button
+          onClick={() => onApply('replace')}
+          className="w-full px-3 py-3 rounded-xl text-left"
+          style={{ background: 'white', border: '1.5px solid rgba(220, 38, 38, 0.4)' }}
+        >
+          <div className="text-sm font-bold" style={{ color: '#b91c1c' }}>Skriv över allt</div>
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-muted)' }}>
+            Ersätter all din nuvarande data med innehållet i filen. Går inte att ångra.
+          </div>
+        </button>
+      </div>
+
+      <button onClick={onCancel} className="w-full py-3 rounded-xl text-sm font-semibold"
+        style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}>
+        Avbryt
+      </button>
     </ModalShell>
   );
 }
