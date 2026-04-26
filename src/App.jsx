@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Play, Pause, Plus, X, Trash2, Edit2, Settings as SettingsIcon,
   Users, BarChart3, Activity, RotateCcw, ArrowLeftRight, Award,
   AlertTriangle, ChevronDown, Square, Save, Goal as GoalIcon,
-  Clock, Hash, Check
+  Clock, Hash, Check, ListChecks, Calendar, Copy, ChevronRight, ArrowLeft
 } from 'lucide-react';
 
 // ===================================================================
@@ -13,7 +13,10 @@ import {
 const STORAGE_KEYS = {
   settings: 'app:settings',
   roster: 'app:roster',
-  game: 'app:currentGame',
+  matches: 'app:matches',
+  activeMatchId: 'app:activeMatchId',
+  // Old key, only read for migration
+  legacyGame: 'app:currentGame',
 };
 
 const DEFAULT_SETTINGS = {
@@ -33,12 +36,9 @@ const CARD_TYPES = [
   { value: 'red',    label: 'Rött kort', color: '#dc2626' },
 ];
 
-// All formations have positions with { x, y, role } where x∈[0,1] left→right and y∈[0,1] own goal→opponent goal
 const FORMATS = {
   '3v3': {
-    label: '3 mot 3',
-    playerCount: 3,
-    halfMinutes: 15,
+    label: '3 mot 3', playerCount: 3, halfMinutes: 15,
     formations: [
       { name: 'Triangel', positions: [
         { role: 'B', x: 0.50, y: 0.20 },
@@ -58,9 +58,7 @@ const FORMATS = {
     ],
   },
   '5v5': {
-    label: '5 mot 5',
-    playerCount: 5,
-    halfMinutes: 20,
+    label: '5 mot 5', playerCount: 5, halfMinutes: 20,
     formations: [
       { name: '2-2', positions: [
         { role: 'MV', x: 0.50, y: 0.08 },
@@ -93,9 +91,7 @@ const FORMATS = {
     ],
   },
   '7v7': {
-    label: '7 mot 7',
-    playerCount: 7,
-    halfMinutes: 25,
+    label: '7 mot 7', playerCount: 7, halfMinutes: 25,
     formations: [
       { name: '2-3-1', positions: [
         { role: 'MV', x: 0.50, y: 0.07 },
@@ -136,9 +132,7 @@ const FORMATS = {
     ],
   },
   '9v9': {
-    label: '9 mot 9',
-    playerCount: 9,
-    halfMinutes: 30,
+    label: '9 mot 9', playerCount: 9, halfMinutes: 30,
     formations: [
       { name: '3-3-2', positions: [
         { role: 'MV', x: 0.50, y: 0.06 },
@@ -176,9 +170,7 @@ const FORMATS = {
     ],
   },
   '11v11': {
-    label: '11 mot 11',
-    playerCount: 11,
-    halfMinutes: 45,
+    label: '11 mot 11', playerCount: 11, halfMinutes: 45,
     formations: [
       { name: '4-4-2', positions: [
         { role: 'MV', x: 0.50, y: 0.05 },
@@ -258,34 +250,55 @@ const initials = (name) => {
     : parts[0].slice(0, 2).toUpperCase();
 };
 
-function makeNewGame(format, roster = []) {
+const firstName = (name) => {
+  if (!name) return '?';
+  return name.trim().split(/\s+/)[0];
+};
+
+function makeNewMatch({ format = '7v7', name, opponent = '', squad = [], existingNames = [] } = {}) {
   const def = FORMATS[format];
-  const sorted = [...roster].sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
-  const lineup = Array(def.playerCount).fill(null);
-  for (let i = 0; i < Math.min(def.playerCount, sorted.length); i++) {
-    lineup[i] = sorted[i].id;
+  // Auto-generate name like "Match 1", "Match 2" if not provided
+  let resolvedName = name;
+  if (!resolvedName) {
+    const usedNumbers = existingNames
+      .map(n => /^Match (\d+)$/.exec(n))
+      .filter(Boolean)
+      .map(m => Number(m[1]));
+    const next = usedNumbers.length ? Math.max(...usedNumbers) + 1 : 1;
+    resolvedName = `Match ${next}`;
   }
-  const bench = sorted.slice(def.playerCount).map(p => p.id);
+  // Distribute squad into lineup + bench
+  const lineup = Array(def.playerCount).fill(null);
+  for (let i = 0; i < Math.min(def.playerCount, squad.length); i++) {
+    lineup[i] = squad[i];
+  }
+  const bench = squad.slice(def.playerCount);
+
   return {
+    id: uid(),
+    name: resolvedName,
+    opponent,
     format,
     formationName: def.formations[0].name,
+    halfMinutes: def.halfMinutes,
+    squad: [...squad],
     lineup,
     bench,
     homeScore: 0,
     awayScore: 0,
     half: 1,
-    halfMinutes: def.halfMinutes,
     clockSeconds: 0,
     clockRunning: false,
     events: [],
     playingTime: {},
-    startedAt: Date.now(),
+    createdAt: Date.now(),
+    startedAt: null,
   };
 }
 
-function getFormation(format, name) {
+function getFormation(format, formationName) {
   const def = FORMATS[format];
-  return def.formations.find(f => f.name === name) || def.formations[0];
+  return def.formations.find(f => f.name === formationName) || def.formations[0];
 }
 
 // ===================================================================
@@ -296,14 +309,23 @@ export default function FootballCoachApp() {
   const [view, setView] = useState('match');
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [roster, setRoster] = useState([]);
-  const [game, setGame] = useState(() => makeNewGame('7v7', []));
+  const [matches, setMatches] = useState([]);
+  const [activeMatchId, setActiveMatchId] = useState(null);
   const [loaded, setLoaded] = useState(false);
 
+  // UI / modal state
   const [selectedPlayerId, setSelectedPlayerId] = useState(null);
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
-  const [goalModalOpen, setGoalModalOpen] = useState(null); // 'home' | 'away'
+  const [goalModalOpen, setGoalModalOpen] = useState(null);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [editingMatchId, setEditingMatchId] = useState(null); // null | 'new' | matchId
+  const [confirmDeleteMatchId, setConfirmDeleteMatchId] = useState(null);
+
+  const activeMatch = useMemo(
+    () => matches.find(m => m.id === activeMatchId) || null,
+    [matches, activeMatchId]
+  );
 
   // ----- Fonts -----
   useEffect(() => {
@@ -314,26 +336,70 @@ export default function FootballCoachApp() {
     return () => { try { document.head.removeChild(link); } catch (e) {} };
   }, []);
 
-  // ----- Load -----
+  // ----- Load (with migration from old single-game format) -----
   useEffect(() => {
     (async () => {
       if (typeof window === 'undefined' || !window.storage) { setLoaded(true); return; }
+      // Settings
       try {
         const s = await window.storage.get(STORAGE_KEYS.settings).catch(() => null);
         if (s?.value) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(s.value) });
       } catch (e) {}
+      // Roster
       let loadedRoster = [];
       try {
         const r = await window.storage.get(STORAGE_KEYS.roster).catch(() => null);
         if (r?.value) { loadedRoster = JSON.parse(r.value); setRoster(loadedRoster); }
       } catch (e) {}
+      // Matches — try new format first
+      let loadedMatches = null;
       try {
-        const g = await window.storage.get(STORAGE_KEYS.game).catch(() => null);
-        if (g?.value) {
-          const loaded = JSON.parse(g.value);
-          setGame({ ...loaded, clockRunning: false });
-        } else if (loadedRoster.length) {
-          setGame(makeNewGame('7v7', loadedRoster));
+        const m = await window.storage.get(STORAGE_KEYS.matches).catch(() => null);
+        if (m?.value) loadedMatches = JSON.parse(m.value);
+      } catch (e) {}
+      // Migrate from old single-game format
+      if (!loadedMatches) {
+        try {
+          const old = await window.storage.get(STORAGE_KEYS.legacyGame).catch(() => null);
+          if (old?.value) {
+            const oldGame = JSON.parse(old.value);
+            const allPlayers = [
+              ...(oldGame.lineup || []).filter(Boolean),
+              ...(oldGame.bench || []),
+            ];
+            loadedMatches = [{
+              id: uid(),
+              name: 'Match 1',
+              opponent: '',
+              format: oldGame.format || '7v7',
+              formationName: oldGame.formationName || FORMATS[oldGame.format || '7v7'].formations[0].name,
+              halfMinutes: oldGame.halfMinutes || FORMATS[oldGame.format || '7v7'].halfMinutes,
+              squad: allPlayers,
+              lineup: oldGame.lineup || Array(FORMATS[oldGame.format || '7v7'].playerCount).fill(null),
+              bench: oldGame.bench || [],
+              homeScore: oldGame.homeScore || 0,
+              awayScore: oldGame.awayScore || 0,
+              half: oldGame.half || 1,
+              clockSeconds: oldGame.clockSeconds || 0,
+              clockRunning: false,
+              events: oldGame.events || [],
+              playingTime: oldGame.playingTime || {},
+              createdAt: oldGame.startedAt || Date.now(),
+              startedAt: oldGame.startedAt || null,
+            }];
+          }
+        } catch (e) {}
+      }
+      // Default: empty matches list — first match is created on demand
+      if (!loadedMatches) loadedMatches = [];
+      setMatches(loadedMatches);
+      // Active match id
+      try {
+        const a = await window.storage.get(STORAGE_KEYS.activeMatchId).catch(() => null);
+        if (a?.value && loadedMatches.find(m => m.id === a.value)) {
+          setActiveMatchId(a.value);
+        } else if (loadedMatches.length > 0) {
+          setActiveMatchId(loadedMatches[0].id);
         }
       } catch (e) {}
       setLoaded(true);
@@ -351,99 +417,219 @@ export default function FootballCoachApp() {
   }, [roster, loaded]);
   useEffect(() => {
     if (!loaded || !window.storage) return;
-    // Save snapshot but freeze clock to avoid odd resume state
-    window.storage.set(STORAGE_KEYS.game, JSON.stringify({ ...game, clockRunning: false })).catch(() => {});
-  }, [game.events, game.lineup, game.bench, game.homeScore, game.awayScore, game.half, game.format, game.formationName, loaded]);
-
-  // ----- Clock tick -----
+    // Pause clocks when serializing
+    const toSave = matches.map(m => ({ ...m, clockRunning: false }));
+    window.storage.set(STORAGE_KEYS.matches, JSON.stringify(toSave)).catch(() => {});
+  }, [matches, loaded]);
   useEffect(() => {
-    if (!game.clockRunning) return;
+    if (!loaded || !window.storage) return;
+    window.storage.set(STORAGE_KEYS.activeMatchId, activeMatchId || '').catch(() => {});
+  }, [activeMatchId, loaded]);
+
+  // ----- Clock tick (only the active match's clock can run) -----
+  useEffect(() => {
+    if (!activeMatch?.clockRunning) return;
     const interval = setInterval(() => {
-      setGame(g => {
-        const newPT = { ...g.playingTime };
-        g.lineup.forEach(pid => {
+      setMatches(ms => ms.map(m => {
+        if (m.id !== activeMatchId) return m;
+        const newPT = { ...m.playingTime };
+        m.lineup.forEach(pid => {
           if (pid) newPT[pid] = (newPT[pid] || 0) + 1;
         });
-        return { ...g, clockSeconds: g.clockSeconds + 1, playingTime: newPT };
-      });
+        return {
+          ...m,
+          clockSeconds: m.clockSeconds + 1,
+          playingTime: newPT,
+          startedAt: m.startedAt || Date.now(),
+        };
+      }));
     }, 1000);
     return () => clearInterval(interval);
-  }, [game.clockRunning]);
+  }, [activeMatch?.clockRunning, activeMatchId]);
 
-  // ----- Sync roster ↔ game (auto-add new roster players to bench, remove deleted) -----
+  // ----- Sync roster ↔ active match's squad -----
+  // If a player is removed from the master roster, also remove from any match's squad/lineup/bench.
   useEffect(() => {
     if (!loaded) return;
     const rosterIds = new Set(roster.map(p => p.id));
-    const inLineup = new Set(game.lineup.filter(Boolean));
-    const inBench = new Set(game.bench);
-    // Add new roster players to bench
-    const additions = roster.filter(p => !inLineup.has(p.id) && !inBench.has(p.id)).map(p => p.id);
-    // Remove deleted players
-    const newLineup = game.lineup.map(pid => (pid && !rosterIds.has(pid)) ? null : pid);
-    const newBench = [...game.bench.filter(pid => rosterIds.has(pid)), ...additions];
-    if (additions.length || newLineup.some((p, i) => p !== game.lineup[i]) || newBench.length !== game.bench.length) {
-      setGame(g => ({ ...g, lineup: newLineup, bench: newBench }));
-    }
+    setMatches(ms => ms.map(m => {
+      const squad = m.squad.filter(id => rosterIds.has(id));
+      const lineup = m.lineup.map(id => (id && rosterIds.has(id)) ? id : null);
+      const bench = m.bench.filter(id => rosterIds.has(id));
+      if (squad.length === m.squad.length && bench.length === m.bench.length &&
+          lineup.every((id, i) => id === m.lineup[i])) {
+        return m;
+      }
+      return { ...m, squad, lineup, bench };
+    }));
   }, [roster, loaded]);
 
-  // ============== ACTIONS ==============
+  // ============== HELPERS TO MUTATE ACTIVE MATCH ==============
 
-  const toggleClock = () => setGame(g => ({ ...g, clockRunning: !g.clockRunning }));
+  const updateActiveMatch = (updater) => {
+    if (!activeMatchId) return;
+    setMatches(ms => ms.map(m => m.id === activeMatchId ? updater(m) : m));
+  };
 
-  const adjustClock = (delta) => setGame(g => ({
-    ...g, clockSeconds: Math.max(0, g.clockSeconds + delta),
-  }));
+  // ============== MATCH-LEVEL ACTIONS ==============
 
-  const goNextHalf = () => setGame(g => ({
-    ...g, half: g.half + 1, clockSeconds: 0, clockRunning: false,
-  }));
-
-  const setFormat = (newFormat) => {
-    const def = FORMATS[newFormat];
-    setGame(g => {
-      // Preserve current players: keep field players in lineup, push to bench if too many
-      const allInPlay = [...g.lineup.filter(Boolean), ...g.bench];
-      const newLineup = Array(def.playerCount).fill(null);
-      for (let i = 0; i < Math.min(def.playerCount, allInPlay.length); i++) {
-        newLineup[i] = allInPlay[i];
-      }
-      const newBench = allInPlay.slice(def.playerCount);
-      return {
-        ...g,
-        format: newFormat,
-        formationName: def.formations[0].name,
-        halfMinutes: def.halfMinutes,
-        lineup: newLineup,
-        bench: newBench,
-      };
+  const createMatch = (config) => {
+    const existingNames = matches.map(m => m.name);
+    // Default squad to all current roster
+    const defaultSquad = roster.map(p => p.id);
+    const newMatch = makeNewMatch({
+      format: config?.format || activeMatch?.format || '7v7',
+      name: config?.name,
+      opponent: config?.opponent || '',
+      squad: config?.squad ?? defaultSquad,
+      existingNames,
     });
+    setMatches(ms => [...ms, newMatch]);
+    setActiveMatchId(newMatch.id);
+    return newMatch.id;
+  };
+
+  const updateMatch = (matchId, updates) => {
+    setMatches(ms => ms.map(m => {
+      if (m.id !== matchId) return m;
+      const updated = { ...m, ...updates };
+      // If format changed, reset formation/halfMinutes and re-distribute squad
+      if (updates.format && updates.format !== m.format) {
+        const def = FORMATS[updates.format];
+        updated.formationName = def.formations[0].name;
+        updated.halfMinutes = def.halfMinutes;
+      }
+      // If squad changed, redistribute to lineup/bench preserving on-field positions when possible
+      if (updates.squad) {
+        const newSquadSet = new Set(updates.squad);
+        const def = FORMATS[updated.format];
+        // Keep current on-field players that are still in squad
+        const newLineup = m.lineup.map(id => (id && newSquadSet.has(id)) ? id : null);
+        // Resize lineup to match format
+        if (newLineup.length < def.playerCount) {
+          while (newLineup.length < def.playerCount) newLineup.push(null);
+        } else if (newLineup.length > def.playerCount) {
+          newLineup.length = def.playerCount;
+        }
+        // Bench = squad members not on field
+        const onFieldSet = new Set(newLineup.filter(Boolean));
+        let bench = updates.squad.filter(id => !onFieldSet.has(id));
+        // Fill empty lineup slots from bench
+        for (let i = 0; i < newLineup.length; i++) {
+          if (!newLineup[i] && bench.length > 0) {
+            newLineup[i] = bench.shift();
+          }
+        }
+        updated.lineup = newLineup;
+        updated.bench = bench;
+      } else if (updates.format && updates.format !== m.format) {
+        // Format changed but squad didn't — re-fit
+        const def = FORMATS[updates.format];
+        const all = [...m.lineup.filter(Boolean), ...m.bench];
+        const newLineup = Array(def.playerCount).fill(null);
+        for (let i = 0; i < Math.min(def.playerCount, all.length); i++) newLineup[i] = all[i];
+        updated.lineup = newLineup;
+        updated.bench = all.slice(def.playerCount);
+      }
+      return updated;
+    }));
+  };
+
+  const deleteMatch = (matchId) => {
+    setMatches(ms => ms.filter(m => m.id !== matchId));
+    if (activeMatchId === matchId) {
+      setMatches(ms => {
+        const remaining = ms.filter(m => m.id !== matchId);
+        setActiveMatchId(remaining.length ? remaining[0].id : null);
+        return remaining;
+      });
+    }
+    setConfirmDeleteMatchId(null);
+  };
+
+  const duplicateMatch = (matchId) => {
+    const original = matches.find(m => m.id === matchId);
+    if (!original) return;
+    const def = FORMATS[original.format];
+    const lineup = Array(def.playerCount).fill(null);
+    for (let i = 0; i < Math.min(def.playerCount, original.squad.length); i++) {
+      lineup[i] = original.squad[i];
+    }
+    const copy = {
+      ...original,
+      id: uid(),
+      name: original.name + ' (kopia)',
+      lineup,
+      bench: original.squad.slice(def.playerCount),
+      homeScore: 0,
+      awayScore: 0,
+      half: 1,
+      clockSeconds: 0,
+      clockRunning: false,
+      events: [],
+      playingTime: {},
+      createdAt: Date.now(),
+      startedAt: null,
+    };
+    setMatches(ms => [...ms, copy]);
+    setActiveMatchId(copy.id);
+  };
+
+  const switchActiveMatch = (matchId) => {
+    // Pause any currently running match
+    setMatches(ms => ms.map(m => m.clockRunning ? { ...m, clockRunning: false } : m));
+    setActiveMatchId(matchId);
+    setSelectedPlayerId(null);
+    setView('match');
+  };
+
+  const resetActiveMatch = () => {
+    if (!activeMatch) return;
+    const def = FORMATS[activeMatch.format];
+    const lineup = Array(def.playerCount).fill(null);
+    for (let i = 0; i < Math.min(def.playerCount, activeMatch.squad.length); i++) {
+      lineup[i] = activeMatch.squad[i];
+    }
+    updateActiveMatch(m => ({
+      ...m,
+      lineup,
+      bench: m.squad.slice(def.playerCount),
+      homeScore: 0,
+      awayScore: 0,
+      half: 1,
+      clockSeconds: 0,
+      clockRunning: false,
+      events: [],
+      playingTime: {},
+      startedAt: null,
+    }));
+    setConfirmReset(false);
     setSelectedPlayerId(null);
   };
 
+  // ============== ACTIVE MATCH ACTIONS ==============
+
+  const toggleClock = () => updateActiveMatch(m => ({ ...m, clockRunning: !m.clockRunning }));
+  const adjustClock = (delta) => updateActiveMatch(m => ({ ...m, clockSeconds: Math.max(0, m.clockSeconds + delta) }));
+  const goNextHalf = () => updateActiveMatch(m => ({ ...m, half: m.half + 1, clockSeconds: 0, clockRunning: false }));
+
   const setFormation = (formationName) => {
-    setGame(g => ({ ...g, formationName }));
+    updateActiveMatch(m => ({ ...m, formationName }));
     setSelectedPlayerId(null);
   };
 
   const tapPlayer = (playerId) => {
-    if (!selectedPlayerId) {
-      setSelectedPlayerId(playerId);
-      return;
-    }
-    if (selectedPlayerId === playerId) {
-      setSelectedPlayerId(null);
-      return;
-    }
+    if (!selectedPlayerId) { setSelectedPlayerId(playerId); return; }
+    if (selectedPlayerId === playerId) { setSelectedPlayerId(null); return; }
     swapPlayers(selectedPlayerId, playerId);
     setSelectedPlayerId(null);
   };
 
   const tapEmptyPosition = (positionIndex) => {
     if (!selectedPlayerId) return;
-    setGame(g => {
-      const newLineup = [...g.lineup];
-      const newBench = [...g.bench];
-      // Remove from lineup if there
+    updateActiveMatch(m => {
+      const newLineup = [...m.lineup];
+      const newBench = [...m.bench];
       const fromLineupIdx = newLineup.indexOf(selectedPlayerId);
       if (fromLineupIdx !== -1) {
         newLineup[fromLineupIdx] = null;
@@ -452,30 +638,24 @@ export default function FootballCoachApp() {
         if (benchIdx !== -1) newBench.splice(benchIdx, 1);
       }
       newLineup[positionIndex] = selectedPlayerId;
-      return { ...g, lineup: newLineup, bench: newBench };
+      return { ...m, lineup: newLineup, bench: newBench };
     });
     setSelectedPlayerId(null);
   };
 
   const swapPlayers = (id1, id2) => {
-    setGame(g => {
-      const newLineup = [...g.lineup];
-      const newBench = [...g.bench];
+    updateActiveMatch(m => {
+      const newLineup = [...m.lineup];
+      const newBench = [...m.bench];
       const i1 = newLineup.indexOf(id1);
       const i2 = newLineup.indexOf(id2);
       const onField1 = i1 !== -1, onField2 = i2 !== -1;
 
       if (onField1 && onField2) {
-        // both on field — swap positions
-        newLineup[i1] = id2;
-        newLineup[i2] = id1;
-        return { ...g, lineup: newLineup, bench: newBench };
+        newLineup[i1] = id2; newLineup[i2] = id1;
+        return { ...m, lineup: newLineup, bench: newBench };
       }
-      if (!onField1 && !onField2) {
-        // both on bench — no-op
-        return g;
-      }
-      // one on field, one on bench → substitution
+      if (!onField1 && !onField2) return m;
       const fieldId = onField1 ? id1 : id2;
       const benchId = onField1 ? id2 : id1;
       const fieldPos = onField1 ? i1 : i2;
@@ -484,67 +664,48 @@ export default function FootballCoachApp() {
       if (benchIdx !== -1) newBench.splice(benchIdx, 1);
       newBench.push(fieldId);
       const newEvent = {
-        id: uid(), type: 'sub', time: g.clockSeconds, half: g.half,
+        id: uid(), type: 'sub', time: m.clockSeconds, half: m.half,
         outId: fieldId, inId: benchId, ts: Date.now(),
       };
-      return { ...g, lineup: newLineup, bench: newBench, events: [newEvent, ...g.events] };
+      return { ...m, lineup: newLineup, bench: newBench, events: [newEvent, ...m.events] };
     });
-  };
-
-  const removeFromField = (positionIndex) => {
-    setGame(g => {
-      const playerId = g.lineup[positionIndex];
-      if (!playerId) return g;
-      const newLineup = [...g.lineup];
-      newLineup[positionIndex] = null;
-      const newBench = [...g.bench, playerId];
-      return { ...g, lineup: newLineup, bench: newBench };
-    });
-    setSelectedPlayerId(null);
   };
 
   const recordGoal = (team, scorerId, assistId) => {
-    setGame(g => ({
-      ...g,
-      [team === 'home' ? 'homeScore' : 'awayScore']: g[team === 'home' ? 'homeScore' : 'awayScore'] + 1,
+    updateActiveMatch(m => ({
+      ...m,
+      [team === 'home' ? 'homeScore' : 'awayScore']: m[team === 'home' ? 'homeScore' : 'awayScore'] + 1,
       events: [{
         id: uid(), type: 'goal', team, scorerId, assistId,
-        time: g.clockSeconds, half: g.half, ts: Date.now(),
-      }, ...g.events],
+        time: m.clockSeconds, half: m.half, ts: Date.now(),
+      }, ...m.events],
     }));
     setGoalModalOpen(null);
   };
 
   const recordCard = (playerId, cardType) => {
-    setGame(g => ({
-      ...g,
+    updateActiveMatch(m => ({
+      ...m,
       events: [{
         id: uid(), type: 'card', playerId, cardType,
-        time: g.clockSeconds, half: g.half, ts: Date.now(),
-      }, ...g.events],
+        time: m.clockSeconds, half: m.half, ts: Date.now(),
+      }, ...m.events],
     }));
     setCardModalOpen(false);
   };
 
   const undoLastEvent = () => {
-    setGame(g => {
-      if (g.events.length === 0) return g;
-      const [latest, ...rest] = g.events;
-      const updates = { ...g, events: rest };
+    updateActiveMatch(m => {
+      if (m.events.length === 0) return m;
+      const [latest, ...rest] = m.events;
+      const updates = { ...m, events: rest };
       if (latest.type === 'goal') {
         updates[latest.team === 'home' ? 'homeScore' : 'awayScore'] = Math.max(
-          0, g[latest.team === 'home' ? 'homeScore' : 'awayScore'] - 1
+          0, m[latest.team === 'home' ? 'homeScore' : 'awayScore'] - 1
         );
       }
-      // Note: 'sub' events are not auto-reversed (would be confusing — players have moved)
       return updates;
     });
-  };
-
-  const startNewMatch = () => {
-    setGame(makeNewGame(game.format, roster));
-    setConfirmReset(false);
-    setSelectedPlayerId(null);
   };
 
   // Roster ops
@@ -552,18 +713,17 @@ export default function FootballCoachApp() {
   const updatePlayer = (id, updates) => setRoster(r => r.map(p => p.id === id ? { ...p, ...updates } : p));
   const removePlayer = (id) => setRoster(r => r.filter(p => p.id !== id));
 
-  // Player lookup
   const playerById = useMemo(() => {
-    const m = new Map();
-    roster.forEach(p => m.set(p.id, p));
-    return m;
+    const map = new Map();
+    roster.forEach(p => map.set(p.id, p));
+    return map;
   }, [roster]);
 
-  // Stats — goals/assists/cards per player
   const playerStats = useMemo(() => {
     const s = {};
     roster.forEach(p => { s[p.id] = { goals: 0, assists: 0, yellow: 0, red: 0 }; });
-    game.events.forEach(e => {
+    if (!activeMatch) return s;
+    activeMatch.events.forEach(e => {
       if (e.type === 'goal' && e.team === 'home') {
         if (e.scorerId && s[e.scorerId]) s[e.scorerId].goals++;
         if (e.assistId && s[e.assistId]) s[e.assistId].assists++;
@@ -574,7 +734,7 @@ export default function FootballCoachApp() {
       }
     });
     return s;
-  }, [game.events, roster]);
+  }, [activeMatch, roster]);
 
   // ============== RENDER ==============
 
@@ -586,117 +746,137 @@ export default function FootballCoachApp() {
     );
   }
 
+  // Match setup view (overlays everything when active)
+  if (editingMatchId !== null) {
+    const editingMatch = editingMatchId === 'new' ? null : matches.find(m => m.id === editingMatchId);
+    return (
+      <div className="min-h-screen pb-8" style={{ background: '#f4ede0', color: '#1a1814', fontFamily: '"Plus Jakarta Sans", system-ui, sans-serif' }}>
+        <GlobalStyles />
+        <div className="max-w-md mx-auto">
+          <MatchSetupView
+            match={editingMatch}
+            roster={roster}
+            existingNames={matches.filter(m => m.id !== editingMatch?.id).map(m => m.name)}
+            onCancel={() => setEditingMatchId(null)}
+            onSave={(config) => {
+              if (editingMatchId === 'new') {
+                createMatch(config);
+              } else {
+                updateMatch(editingMatchId, config);
+              }
+              setEditingMatchId(null);
+              setView('match');
+            }}
+            onDelete={editingMatch ? () => setConfirmDeleteMatchId(editingMatch.id) : null}
+          />
+        </div>
+        {confirmDeleteMatchId && (
+          <ConfirmModal
+            title="Ta bort match?"
+            message="Matchens data försvinner permanent. Truppen påverkas inte."
+            confirmLabel="Ta bort"
+            onConfirm={() => {
+              deleteMatch(confirmDeleteMatchId);
+              setEditingMatchId(null);
+            }}
+            onCancel={() => setConfirmDeleteMatchId(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
   return (
     <div
       className="min-h-screen pb-24"
-      style={{
-        background: '#f4ede0',
-        color: '#1a1814',
-        fontFamily: '"Plus Jakarta Sans", system-ui, sans-serif',
-        WebkitTapHighlightColor: 'transparent',
-      }}
+      style={{ background: '#f4ede0', color: '#1a1814', fontFamily: '"Plus Jakarta Sans", system-ui, sans-serif', WebkitTapHighlightColor: 'transparent' }}
     >
-      <style>{`
-        :root {
-          --bg: #f4ede0;
-          --surface: #fbf6eb;
-          --ink: #1a1814;
-          --ink-muted: #6b6357;
-          --ink-faint: #a39c8d;
-          --border: #e3d8c1;
-          --border-strong: #c9bda0;
-          --pitch-green: #2e6e3f;
-          --pitch-green-dark: #245a32;
-          --pitch-line: rgba(255,255,255,0.55);
-          --accent: #d8501a;
-          --accent-soft: rgba(216, 80, 26, 0.12);
-          --accent-strong: #b13d10;
-          --warn: #c97c0b;
-        }
-        html, body { background: var(--bg); }
-        .display { font-family: 'Bricolage Grotesque', sans-serif; letter-spacing: -0.01em; }
-        .tabular { font-variant-numeric: tabular-nums; }
-        button { transition: transform 60ms ease, background-color 120ms ease, border-color 120ms ease, opacity 120ms; touch-action: manipulation; }
-        button:active:not(:disabled) { transform: scale(0.97); }
-        @keyframes spin-pulse {
-          0%, 100% { box-shadow: 0 0 0 0 rgba(216, 80, 26, 0.6); }
-          50% { box-shadow: 0 0 0 6px rgba(216, 80, 26, 0); }
-        }
-        .selected-ring { animation: spin-pulse 1.4s ease-in-out infinite; }
-        .scrollbar-thin::-webkit-scrollbar { width: 5px; height: 5px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
-      `}</style>
+      <GlobalStyles />
 
       <div className="max-w-md mx-auto">
-        {view === 'match' && (
-          <MatchView
+        {view === 'matches' && (
+          <MatchesListView
+            matches={matches}
+            activeMatchId={activeMatchId}
             settings={settings}
-            game={game}
             roster={roster}
-            playerById={playerById}
-            selectedPlayerId={selectedPlayerId}
-            onSelectPlayer={tapPlayer}
-            onTapEmpty={tapEmptyPosition}
-            onRemoveFromField={removeFromField}
-            onToggleClock={toggleClock}
-            onAdjustClock={adjustClock}
-            onNextHalf={goNextHalf}
-            onOpenFormatPicker={() => setFormatPickerOpen(true)}
-            onOpenGoal={(t) => setGoalModalOpen(t)}
-            onOpenCard={() => setCardModalOpen(true)}
-            onUndo={undoLastEvent}
-            onAskReset={() => setConfirmReset(true)}
+            onOpen={(id) => switchActiveMatch(id)}
+            onEdit={(id) => setEditingMatchId(id)}
+            onCreate={() => setEditingMatchId('new')}
+            onDuplicate={duplicateMatch}
           />
         )}
-        {view === 'time' && (
-          <TimeView game={game} roster={roster} playerById={playerById} />
+        {view === 'match' && (
+          activeMatch ? (
+            <MatchView
+              settings={settings}
+              match={activeMatch}
+              roster={roster}
+              playerById={playerById}
+              selectedPlayerId={selectedPlayerId}
+              onSelectPlayer={tapPlayer}
+              onTapEmpty={tapEmptyPosition}
+              onToggleClock={toggleClock}
+              onAdjustClock={adjustClock}
+              onNextHalf={goNextHalf}
+              onOpenFormatPicker={() => setFormatPickerOpen(true)}
+              onOpenGoal={(t) => setGoalModalOpen(t)}
+              onOpenCard={() => setCardModalOpen(true)}
+              onUndo={undoLastEvent}
+              onAskReset={() => setConfirmReset(true)}
+              onEditMatch={() => setEditingMatchId(activeMatchId)}
+              onGoToMatches={() => setView('matches')}
+            />
+          ) : (
+            <NoMatchEmptyState onCreate={() => setEditingMatchId('new')} hasRoster={roster.length > 0} />
+          )
         )}
         {view === 'stats' && (
-          <StatsView game={game} roster={roster} settings={settings} playerStats={playerStats} playerById={playerById} />
+          <StatsView match={activeMatch} roster={roster} settings={settings} playerStats={playerStats} playerById={playerById} />
         )}
         {view === 'roster' && (
           <RosterView roster={roster} onAdd={addPlayer} onUpdate={updatePlayer} onRemove={removePlayer} />
         )}
         {view === 'settings' && (
-          <SettingsView settings={settings} onChange={setSettings} onAskReset={() => setConfirmReset(true)} />
+          <SettingsView settings={settings} onChange={setSettings} onAskReset={() => setConfirmReset(true)} hasActiveMatch={!!activeMatch} />
         )}
       </div>
 
       <BottomNav view={view} setView={setView} />
 
-      {formatPickerOpen && (
+      {formatPickerOpen && activeMatch && (
         <FormatPickerModal
-          format={game.format}
-          formationName={game.formationName}
-          onSetFormat={setFormat}
+          format={activeMatch.format}
+          formationName={activeMatch.formationName}
+          onSetFormat={(f) => updateMatch(activeMatchId, { format: f })}
           onSetFormation={setFormation}
           onClose={() => setFormatPickerOpen(false)}
         />
       )}
-      {goalModalOpen && (
+      {goalModalOpen && activeMatch && (
         <GoalModal
           team={goalModalOpen}
           settings={settings}
-          game={game}
+          match={activeMatch}
           playerById={playerById}
           onClose={() => setGoalModalOpen(null)}
           onSave={(scorerId, assistId) => recordGoal(goalModalOpen, scorerId, assistId)}
         />
       )}
-      {cardModalOpen && (
+      {cardModalOpen && activeMatch && (
         <CardModal
-          game={game}
-          roster={roster}
+          match={activeMatch}
+          playerById={playerById}
           onClose={() => setCardModalOpen(false)}
           onSave={recordCard}
         />
       )}
       {confirmReset && (
         <ConfirmModal
-          title="Ny match?"
-          message="Allt utom truppen återställs (klocka, mål, speltid, byten)."
-          confirmLabel="Ja, ny match"
-          onConfirm={startNewMatch}
+          title="Återställ matchen?"
+          message="Klocka, mål och speltid nollställs. Truppen behålls."
+          confirmLabel="Ja, återställ"
+          onConfirm={resetActiveMatch}
           onCancel={() => setConfirmReset(false)}
         />
       )}
@@ -705,39 +885,503 @@ export default function FootballCoachApp() {
 }
 
 // ===================================================================
-// MATCH VIEW (the main screen)
+// GLOBAL STYLES
 // ===================================================================
 
-function MatchView({
-  settings, game, roster, playerById, selectedPlayerId,
-  onSelectPlayer, onTapEmpty, onRemoveFromField,
-  onToggleClock, onAdjustClock, onNextHalf,
-  onOpenFormatPicker, onOpenGoal, onOpenCard, onUndo, onAskReset,
-}) {
-  const formatDef = FORMATS[game.format];
-  const formation = getFormation(game.format, game.formationName);
-  const halfTotal = game.halfMinutes * 60;
-  const overtime = game.clockSeconds > halfTotal;
-  const lastEvent = game.events[0];
+function GlobalStyles() {
+  return (
+    <style>{`
+      :root {
+        --bg: #f4ede0;
+        --surface: #fbf6eb;
+        --ink: #1a1814;
+        --ink-muted: #6b6357;
+        --ink-faint: #a39c8d;
+        --border: #e3d8c1;
+        --border-strong: #c9bda0;
+        --pitch-green: #2e6e3f;
+        --pitch-green-dark: #245a32;
+        --pitch-line: rgba(255,255,255,0.55);
+        --accent: #d8501a;
+        --accent-soft: rgba(216, 80, 26, 0.12);
+        --accent-strong: #b13d10;
+        --warn: #c97c0b;
+      }
+      html, body { background: var(--bg); }
+      .display { font-family: 'Bricolage Grotesque', sans-serif; letter-spacing: -0.01em; }
+      .tabular { font-variant-numeric: tabular-nums; }
+      button { transition: transform 60ms ease, background-color 120ms ease, border-color 120ms ease, opacity 120ms; touch-action: manipulation; }
+      button:active:not(:disabled) { transform: scale(0.97); }
+      @keyframes spin-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(216, 80, 26, 0.6); }
+        50% { box-shadow: 0 0 0 6px rgba(216, 80, 26, 0); }
+      }
+      .selected-ring { animation: spin-pulse 1.4s ease-in-out infinite; }
+      .scrollbar-thin::-webkit-scrollbar { width: 5px; height: 5px; }
+      .scrollbar-thin::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+    `}</style>
+  );
+}
+
+// ===================================================================
+// EMPTY STATE (no active match)
+// ===================================================================
+
+function NoMatchEmptyState({ onCreate, hasRoster }) {
+  return (
+    <div className="px-4 pt-12 text-center">
+      <div className="rounded-2xl p-8" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
+        <Calendar size={32} className="mx-auto mb-3" style={{ color: 'var(--ink-faint)' }} />
+        <div className="display text-2xl font-bold mb-2">Ingen match igång</div>
+        <div className="text-sm mb-5" style={{ color: 'var(--ink-muted)' }}>
+          {hasRoster
+            ? 'Skapa en match för att sätta lag och starta klockan.'
+            : 'Lägg först till spelare under "Trupp", skapa sen en match.'}
+        </div>
+        <button
+          onClick={onCreate}
+          className="px-5 py-3 rounded-xl text-sm font-semibold inline-flex items-center gap-1.5"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          <Plus size={16} /> Skapa första matchen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ===================================================================
+// MATCHES LIST VIEW
+// ===================================================================
+
+function MatchesListView({ matches, activeMatchId, settings, roster, onOpen, onEdit, onCreate, onDuplicate }) {
+  const sorted = [...matches].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
   return (
     <div className="px-4 pt-5">
-      {/* Top bar: format + halftime status + actions */}
-      <div className="flex items-center gap-2 mb-4">
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h1 className="display text-3xl font-bold">Matcher</h1>
+          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+            {matches.length} match{matches.length === 1 ? '' : 'er'}
+          </div>
+        </div>
+        <button
+          onClick={onCreate}
+          className="px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-1.5"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          <Plus size={16} /> Ny match
+        </button>
+      </div>
+
+      {matches.length === 0 ? (
+        <div className="rounded-2xl p-8 text-center" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
+          <Calendar size={28} className="mx-auto mb-3" style={{ color: 'var(--ink-faint)' }} />
+          <div className="text-sm font-semibold mb-1">Inga matcher ännu</div>
+          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+            Skapa en match för att kunna sätta lag och starta klockan
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {sorted.map(m => (
+            <MatchCard
+              key={m.id}
+              match={m}
+              isActive={m.id === activeMatchId}
+              settings={settings}
+              roster={roster}
+              onOpen={() => onOpen(m.id)}
+              onEdit={() => onEdit(m.id)}
+              onDuplicate={() => onDuplicate(m.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MatchCard({ match, isActive, settings, roster, onOpen, onEdit, onDuplicate }) {
+  const fmt = FORMATS[match.format];
+  const isStarted = match.events.length > 0 || match.clockSeconds > 0 || match.homeScore > 0 || match.awayScore > 0;
+  const opponentLabel = match.opponent || settings.awayTeam;
+  return (
+    <div
+      className="rounded-xl overflow-hidden"
+      style={{
+        background: isActive ? 'var(--accent-soft)' : 'var(--surface)',
+        border: `1.5px solid ${isActive ? 'var(--accent)' : 'var(--border)'}`,
+      }}
+    >
+      <button onClick={onOpen} className="w-full text-left p-3 flex items-center gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            {isActive && (
+              <span className="text-[9px] uppercase tracking-widest font-bold px-1.5 py-px rounded"
+                style={{ background: 'var(--accent)', color: 'white' }}>
+                Aktiv
+              </span>
+            )}
+            <div className="text-base font-bold truncate" style={{ color: 'var(--ink)' }}>
+              {match.name}
+            </div>
+          </div>
+          <div className="text-xs truncate" style={{ color: 'var(--ink-muted)' }}>
+            vs {opponentLabel} · {fmt.label} · {match.formationName} · {match.squad.length} i trupp
+          </div>
+          {isStarted ? (
+            <div className="flex items-center gap-2 mt-1.5 text-xs">
+              <span className="display tabular font-bold" style={{ color: 'var(--ink)' }}>
+                {match.homeScore}–{match.awayScore}
+              </span>
+              <span style={{ color: 'var(--ink-faint)' }}>
+                · halvlek {match.half} · {formatClock(match.clockSeconds)}
+              </span>
+            </div>
+          ) : (
+            <div className="text-[11px] mt-1" style={{ color: 'var(--ink-faint)' }}>
+              Ej startad
+            </div>
+          )}
+        </div>
+        <ChevronRight size={18} style={{ color: 'var(--ink-faint)' }} />
+      </button>
+      <div className="flex border-t" style={{ borderColor: 'var(--border)' }}>
+        <button
+          onClick={onEdit}
+          className="flex-1 py-2 text-xs font-semibold flex items-center justify-center gap-1.5"
+          style={{ color: 'var(--ink-muted)' }}
+        >
+          <Edit2 size={12} /> Redigera
+        </button>
+        <button
+          onClick={onDuplicate}
+          className="flex-1 py-2 text-xs font-semibold flex items-center justify-center gap-1.5 border-l"
+          style={{ borderColor: 'var(--border)', color: 'var(--ink-muted)' }}
+        >
+          <Copy size={12} /> Duplicera
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ===================================================================
+// MATCH SETUP VIEW (create / edit)
+// ===================================================================
+
+function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDelete }) {
+  const isNew = !match;
+  const [name, setName] = useState(match?.name || '');
+  const [opponent, setOpponent] = useState(match?.opponent || '');
+  const [format, setFormat] = useState(match?.format || '7v7');
+  const [formationName, setFormationName] = useState(match?.formationName || FORMATS[match?.format || '7v7'].formations[0].name);
+  const [halfMinutes, setHalfMinutes] = useState(match?.halfMinutes || FORMATS[match?.format || '7v7'].halfMinutes);
+  const [squad, setSquad] = useState(() => {
+    if (match) return match.squad;
+    // For new match: include the entire roster by default
+    return roster.map(p => p.id);
+  });
+
+  // When format changes, sync formation/halfMinutes to that format's defaults
+  useEffect(() => {
+    const def = FORMATS[format];
+    if (!def.formations.find(f => f.name === formationName)) {
+      setFormationName(def.formations[0].name);
+    }
+  }, [format]); // eslint-disable-line
+
+  const formatDef = FORMATS[format];
+  const sortedRoster = [...roster].sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
+  const squadSet = new Set(squad);
+  const togglePlayer = (id) => {
+    setSquad(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  };
+  const selectAll = () => setSquad(roster.map(p => p.id));
+  const clearAll = () => setSquad([]);
+
+  // Generate placeholder name for new match
+  const placeholderName = useMemo(() => {
+    const usedNumbers = existingNames
+      .map(n => /^Match (\d+)$/.exec(n))
+      .filter(Boolean)
+      .map(m => Number(m[1]));
+    const next = usedNumbers.length ? Math.max(...usedNumbers) + 1 : 1;
+    return `Match ${next}`;
+  }, [existingNames]);
+
+  const canSave = squad.length > 0 || isNew;
+
+  return (
+    <div className="px-4 pt-5">
+      {/* Header */}
+      <div className="flex items-center gap-2 mb-5">
+        <button onClick={onCancel} className="p-2 -ml-2" style={{ color: 'var(--ink-muted)' }} aria-label="Tillbaka">
+          <ArrowLeft size={18} />
+        </button>
+        <h1 className="display text-2xl font-bold flex-1">
+          {isNew ? 'Ny match' : 'Redigera match'}
+        </h1>
+      </div>
+
+      {/* Name + opponent */}
+      <div className="rounded-2xl p-4 mb-3 space-y-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <div>
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-1.5" style={{ color: 'var(--ink-faint)' }}>Namn</label>
+          <input
+            value={name}
+            onChange={e => setName(e.target.value)}
+            placeholder={placeholderName}
+            className="w-full px-3 py-2.5 rounded-lg outline-none"
+            style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+          />
+        </div>
+        <div>
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-1.5" style={{ color: 'var(--ink-faint)' }}>Motståndare (valfritt)</label>
+          <input
+            value={opponent}
+            onChange={e => setOpponent(e.target.value)}
+            placeholder="t.ex. Hammarby"
+            className="w-full px-3 py-2.5 rounded-lg outline-none"
+            style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+          />
+        </div>
+      </div>
+
+      {/* Format */}
+      <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Spelform</label>
+        <div className="grid grid-cols-5 gap-1.5">
+          {Object.keys(FORMATS).map(k => (
+            <button
+              key={k}
+              onClick={() => setFormat(k)}
+              className="py-2.5 rounded-lg text-xs font-bold"
+              style={{
+                background: format === k ? 'var(--ink)' : 'transparent',
+                color: format === k ? 'var(--bg)' : 'var(--ink)',
+                border: `1px solid ${format === k ? 'var(--ink)' : 'var(--border-strong)'}`,
+              }}
+            >
+              {k}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Formation */}
+      <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Uppställning</label>
+        <div className="grid grid-cols-2 gap-2">
+          {formatDef.formations.map(f => (
+            <button
+              key={f.name}
+              onClick={() => setFormationName(f.name)}
+              className="rounded-xl overflow-hidden text-left"
+              style={{
+                border: `1.5px solid ${formationName === f.name ? 'var(--accent)' : 'var(--border)'}`,
+                background: formationName === f.name ? 'var(--accent-soft)' : 'white',
+              }}
+            >
+              <div className="relative w-full" style={{ aspectRatio: '1 / 1.1', background: 'var(--pitch-green)' }}>
+                <PitchMarkings />
+                {f.positions.map((pos, i) => (
+                  <div key={i} className="absolute rounded-full" style={{
+                    width: 10, height: 10,
+                    left: `${pos.x * 100}%`, top: `${pos.y * 100}%`,
+                    background: 'white', transform: 'translate(-50%, -50%)', border: '1px solid rgba(0,0,0,0.2)',
+                  }} />
+                ))}
+              </div>
+              <div className="px-2 py-1.5 flex items-center justify-between">
+                <span className="text-xs font-bold" style={{ color: 'var(--ink)' }}>{f.name}</span>
+                {formationName === f.name && <Check size={12} style={{ color: 'var(--accent)' }} />}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Half length */}
+      <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Halvlekstid</label>
+        <div className="grid grid-cols-5 gap-1.5">
+          {[15, 20, 25, 30, 45].map(min => (
+            <button
+              key={min}
+              onClick={() => setHalfMinutes(min)}
+              className="py-2.5 rounded-lg text-xs font-bold tabular"
+              style={{
+                background: halfMinutes === min ? 'var(--ink)' : 'transparent',
+                color: halfMinutes === min ? 'var(--bg)' : 'var(--ink)',
+                border: `1px solid ${halfMinutes === min ? 'var(--ink)' : 'var(--border-strong)'}`,
+              }}
+            >
+              {min}'
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Squad picker */}
+      <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <div className="flex items-center justify-between mb-2">
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold" style={{ color: 'var(--ink-faint)' }}>
+            Trupp ({squad.length}/{roster.length})
+          </label>
+          <div className="flex gap-1">
+            <button onClick={selectAll} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>
+              Alla
+            </button>
+            <button onClick={clearAll} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>
+              Rensa
+            </button>
+          </div>
+        </div>
+
+        {squad.length < formatDef.playerCount && squad.length > 0 && (
+          <div className="text-[11px] mb-2 px-2 py-1.5 rounded-lg" style={{ background: 'rgba(201, 124, 11, 0.1)', color: 'var(--warn)' }}>
+            Endast {squad.length} spelare valda — {formatDef.label} kräver minst {formatDef.playerCount} på plan.
+          </div>
+        )}
+
+        {sortedRoster.length === 0 ? (
+          <div className="text-xs text-center py-4" style={{ color: 'var(--ink-muted)' }}>
+            Lägg till spelare under "Trupp" först
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {sortedRoster.map(p => {
+              const inSquad = squadSet.has(p.id);
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => togglePlayer(p.id)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left"
+                  style={{
+                    background: inSquad ? 'var(--accent-soft)' : 'white',
+                    border: `1.5px solid ${inSquad ? 'var(--accent)' : 'var(--border)'}`,
+                  }}
+                >
+                  <div className="flex items-center justify-center rounded shrink-0" style={{
+                    width: 22, height: 22,
+                    background: inSquad ? 'var(--accent)' : 'transparent',
+                    border: inSquad ? 'none' : '1.5px solid var(--border-strong)',
+                  }}>
+                    {inSquad && <Check size={14} style={{ color: 'white' }} />}
+                  </div>
+                  <span className="display tabular text-sm font-bold w-7" style={{ color: 'var(--ink-muted)' }}>
+                    {p.number ? `#${p.number}` : '–'}
+                  </span>
+                  <span className="text-sm font-semibold flex-1 truncate" style={{ color: 'var(--ink)' }}>
+                    {p.name}
+                  </span>
+                  {p.preferredRole && (
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>
+                      {ROLES[p.preferredRole]?.short}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="flex gap-2 mt-5">
+        {onDelete && (
+          <button
+            onClick={onDelete}
+            className="px-4 py-3 rounded-xl text-sm font-semibold"
+            style={{ border: '1px solid rgba(220, 38, 38, 0.4)', color: '#dc2626' }}
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+        <button
+          onClick={onCancel}
+          className="flex-1 py-3 rounded-xl text-sm font-semibold"
+          style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}
+        >
+          Avbryt
+        </button>
+        <button
+          disabled={!canSave}
+          onClick={() => onSave({
+            name: name.trim() || placeholderName,
+            opponent: opponent.trim(),
+            format,
+            formationName,
+            halfMinutes,
+            squad,
+          })}
+          className="flex-1 py-3 rounded-xl text-sm font-bold disabled:opacity-30"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          {isNew ? 'Skapa match' : 'Spara'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ===================================================================
+// MATCH VIEW (live game)
+// ===================================================================
+
+function MatchView({
+  settings, match, roster, playerById, selectedPlayerId,
+  onSelectPlayer, onTapEmpty,
+  onToggleClock, onAdjustClock, onNextHalf,
+  onOpenFormatPicker, onOpenGoal, onOpenCard, onUndo, onAskReset,
+  onEditMatch, onGoToMatches,
+}) {
+  const formatDef = FORMATS[match.format];
+  const formation = getFormation(match.format, match.formationName);
+  const halfTotal = match.halfMinutes * 60;
+  const overtime = match.clockSeconds > halfTotal;
+  const opponentLabel = match.opponent || settings.awayTeam;
+
+  return (
+    <div className="px-4 pt-5">
+      {/* Match header — name + switch */}
+      <div className="flex items-center gap-2 mb-3">
+        <button
+          onClick={onGoToMatches}
+          className="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-xl text-left"
+          style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+        >
+          <ListChecks size={14} style={{ color: 'var(--ink-muted)' }} />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-bold truncate" style={{ color: 'var(--ink)' }}>{match.name}</div>
+            <div className="text-[11px] truncate" style={{ color: 'var(--ink-muted)' }}>vs {opponentLabel}</div>
+          </div>
+          <ChevronDown size={14} style={{ color: 'var(--ink-faint)' }} />
+        </button>
+        <button onClick={onEditMatch} className="p-2.5 rounded-xl" style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--ink-muted)' }} aria-label="Redigera match">
+          <Edit2 size={14} />
+        </button>
+      </div>
+
+      {/* Top row: format + undo */}
+      <div className="flex items-center gap-2 mb-3">
         <button
           onClick={onOpenFormatPicker}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border"
-          style={{ background: 'var(--surface)', borderColor: 'var(--border-strong)', color: 'var(--ink)' }}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold"
+          style={{ background: 'var(--surface)', border: '1px solid var(--border-strong)', color: 'var(--ink)' }}
         >
           <span>{formatDef.label}</span>
           <span className="opacity-50">·</span>
-          <span>{game.formationName}</span>
+          <span>{match.formationName}</span>
           <ChevronDown size={12} className="opacity-60" />
         </button>
         <div className="flex-1" />
         <button
           onClick={onUndo}
-          disabled={game.events.length === 0}
+          disabled={match.events.length === 0}
           className="p-2 rounded-lg disabled:opacity-30"
           style={{ color: 'var(--ink-muted)' }}
           aria-label="Ångra"
@@ -746,40 +1390,34 @@ function MatchView({
         </button>
       </div>
 
-      {/* Score + clock card */}
+      {/* Score + clock */}
       <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
         <div className="flex items-center justify-between gap-3">
-          {/* Home */}
           <div className="flex-1 min-w-0 text-center">
-            <div className="text-[10px] uppercase tracking-widest mb-1" style={{ color: 'var(--ink-muted)' }}>
+            <div className="text-[10px] uppercase tracking-widest mb-1 truncate" style={{ color: 'var(--ink-muted)' }}>
               {settings.homeTeam}
             </div>
-            <div className="display tabular text-5xl font-bold" style={{ color: 'var(--ink)' }}>{game.homeScore}</div>
+            <div className="display tabular text-5xl font-bold" style={{ color: 'var(--ink)' }}>{match.homeScore}</div>
           </div>
-
-          {/* Clock center */}
           <div className="text-center">
             <div className="text-[9px] uppercase tracking-widest mb-1 display font-bold" style={{ color: overtime ? 'var(--accent)' : 'var(--ink-muted)' }}>
-              Halvlek {game.half}
+              Halvlek {match.half}
             </div>
-            <div className={`display tabular text-2xl font-bold ${game.clockRunning ? '' : 'opacity-70'}`} style={{ color: overtime ? 'var(--accent)' : 'var(--ink)' }}>
-              {formatClock(game.clockSeconds)}
+            <div className={`display tabular text-2xl font-bold ${match.clockRunning ? '' : 'opacity-70'}`} style={{ color: overtime ? 'var(--accent)' : 'var(--ink)' }}>
+              {formatClock(match.clockSeconds)}
             </div>
             <div className="text-[9px] mt-0.5 tabular" style={{ color: 'var(--ink-faint)' }}>
-              / {game.halfMinutes}:00
+              / {match.halfMinutes}:00
             </div>
           </div>
-
-          {/* Away */}
           <div className="flex-1 min-w-0 text-center">
-            <div className="text-[10px] uppercase tracking-widest mb-1" style={{ color: 'var(--ink-muted)' }}>
-              {settings.awayTeam}
+            <div className="text-[10px] uppercase tracking-widest mb-1 truncate" style={{ color: 'var(--ink-muted)' }}>
+              {opponentLabel}
             </div>
-            <div className="display tabular text-5xl font-bold" style={{ color: 'var(--ink)' }}>{game.awayScore}</div>
+            <div className="display tabular text-5xl font-bold" style={{ color: 'var(--ink)' }}>{match.awayScore}</div>
           </div>
         </div>
 
-        {/* Clock controls row */}
         <div className="grid grid-cols-5 gap-1.5 mt-3">
           <button
             onClick={() => onAdjustClock(-30)}
@@ -791,12 +1429,9 @@ function MatchView({
           <button
             onClick={onToggleClock}
             className="col-span-3 py-2.5 rounded-lg text-sm font-bold uppercase tracking-wider flex items-center justify-center gap-1.5"
-            style={{
-              background: game.clockRunning ? 'var(--ink)' : 'var(--accent)',
-              color: game.clockRunning ? 'var(--bg)' : 'white',
-            }}
+            style={{ background: match.clockRunning ? 'var(--ink)' : 'var(--accent)', color: match.clockRunning ? 'var(--bg)' : 'white' }}
           >
-            {game.clockRunning ? <><Pause size={14} /> Paus</> : <><Play size={14} /> Start</>}
+            {match.clockRunning ? <><Pause size={14} /> Paus</> : <><Play size={14} /> Start</>}
           </button>
           <button
             onClick={() => onAdjustClock(30)}
@@ -815,12 +1450,12 @@ function MatchView({
         </button>
       </div>
 
-      {/* The pitch */}
+      {/* Pitch */}
       <Pitch
         formation={formation}
-        lineup={game.lineup}
+        lineup={match.lineup}
         playerById={playerById}
-        playingTime={game.playingTime}
+        playingTime={match.playingTime}
         selectedPlayerId={selectedPlayerId}
         onSelectPlayer={onSelectPlayer}
         onTapEmpty={onTapEmpty}
@@ -828,21 +1463,21 @@ function MatchView({
 
       {/* Bench */}
       <Bench
-        bench={game.bench}
+        bench={match.bench}
         playerById={playerById}
-        playingTime={game.playingTime}
+        playingTime={match.playingTime}
         selectedPlayerId={selectedPlayerId}
         onSelectPlayer={onSelectPlayer}
-        rosterCount={roster.length}
+        squadSize={match.squad.length}
       />
 
       {/* Selection hint */}
-      {selectedPlayerId && (
+      {selectedPlayerId && playerById.get(selectedPlayerId) && (
         <div className="rounded-xl px-3 py-2 mb-3 text-xs flex items-center gap-2"
           style={{ background: 'var(--accent-soft)', color: 'var(--accent-strong)', border: '1px solid rgba(216,80,26,0.25)' }}>
           <ArrowLeftRight size={14} />
           <span>
-            <strong>{playerById.get(selectedPlayerId)?.name || 'Spelare'}</strong> vald — knacka annan spelare för byte
+            <strong>{playerById.get(selectedPlayerId).name}</strong> vald — knacka annan spelare för byte
           </span>
           <button onClick={() => onSelectPlayer(selectedPlayerId)} className="ml-auto opacity-70">
             <X size={14} />
@@ -858,27 +1493,22 @@ function MatchView({
       </div>
 
       {/* Recent events */}
-      {game.events.length > 0 && (
+      {match.events.length > 0 && (
         <div className="mt-5 mb-2">
           <div className="text-[10px] uppercase tracking-[0.2em] mb-2 px-1" style={{ color: 'var(--ink-faint)' }}>
             Senaste händelser
           </div>
           <div className="space-y-1.5">
-            {game.events.slice(0, 5).map(e => (
-              <EventRow key={e.id} event={e} playerById={playerById} settings={settings} />
+            {match.events.slice(0, 5).map(e => (
+              <EventRow key={e.id} event={e} playerById={playerById} settings={settings} opponentLabel={opponentLabel} />
             ))}
           </div>
         </div>
       )}
 
-      {/* Reset */}
       <div className="mt-6 flex justify-center">
-        <button
-          onClick={onAskReset}
-          className="text-xs underline"
-          style={{ color: 'var(--ink-faint)' }}
-        >
-          Ny match
+        <button onClick={onAskReset} className="text-xs underline" style={{ color: 'var(--ink-faint)' }}>
+          Återställ matchen
         </button>
       </div>
     </div>
@@ -917,15 +1547,10 @@ function Pitch({ formation, lineup, playerById, playingTime, selectedPlayerId, o
         boxShadow: 'inset 0 0 0 1px rgba(0,0,0,0.25), 0 8px 24px -16px rgba(46, 110, 63, 0.6)',
       }}
     >
-      {/* Pitch markings */}
       <PitchMarkings />
-
-      {/* Subtle grass stripes */}
       <div className="absolute inset-0 pointer-events-none" style={{
         backgroundImage: 'repeating-linear-gradient(180deg, transparent 0, transparent 11.1%, rgba(255,255,255,0.025) 11.1%, rgba(255,255,255,0.025) 22.2%)',
       }} />
-
-      {/* Players */}
       {formation.positions.map((pos, i) => {
         const playerId = lineup[i];
         const player = playerId ? playerById.get(playerId) : null;
@@ -965,25 +1590,18 @@ function PitchMarkings() {
   return (
     <svg viewBox="0 0 100 133" preserveAspectRatio="none" className="absolute inset-0 w-full h-full pointer-events-none">
       <g fill="none" stroke="var(--pitch-line)" strokeWidth="0.4">
-        {/* Outer */}
         <rect x="2" y="2" width="96" height="129" />
-        {/* Halfway line */}
         <line x1="2" y1="66.5" x2="98" y2="66.5" />
-        {/* Center circle + spot */}
         <circle cx="50" cy="66.5" r="9" />
         <circle cx="50" cy="66.5" r="0.8" fill="var(--pitch-line)" />
-        {/* Bottom (own) penalty area */}
         <rect x="22" y="113" width="56" height="18" />
         <rect x="36" y="125" width="28" height="6" />
-        {/* Bottom penalty arc + spot */}
         <path d="M 41,113 A 9 9 0 0 0 59 113" />
         <circle cx="50" cy="121" r="0.8" fill="var(--pitch-line)" />
-        {/* Top (opponent) penalty area */}
         <rect x="22" y="2" width="56" height="18" />
         <rect x="36" y="2" width="28" height="6" />
         <path d="M 41,20 A 9 9 0 0 1 59 20" />
         <circle cx="50" cy="12" r="0.8" fill="var(--pitch-line)" />
-        {/* Corner arcs */}
         <path d="M 2,4 A 2 2 0 0 0 4 2" />
         <path d="M 96,2 A 2 2 0 0 0 98 4" />
         <path d="M 2,129 A 2 2 0 0 1 4 131" />
@@ -993,28 +1611,32 @@ function PitchMarkings() {
   );
 }
 
+// Pitch chip — shows player FIRST NAME (instead of number) on a wider pill.
 function PitchChip({ player, role, seconds, selected, onTap }) {
   const tint = ROLES[role]?.tint || '#3b82f6';
   return (
     <button
       onClick={onTap}
       className={`relative flex flex-col items-center gap-0.5 ${selected ? 'selected-ring' : ''}`}
-      style={{ outline: 'none' }}
+      style={{ outline: 'none', borderRadius: 999 }}
     >
       <div
-        className="rounded-full flex items-center justify-center display tabular font-bold leading-none"
+        className="rounded-full flex items-center justify-center display font-bold leading-none px-2"
         style={{
-          width: 38, height: 38,
+          minWidth: 52,
+          maxWidth: 78,
+          height: 28,
           background: 'white',
           color: 'var(--ink)',
           border: `2px solid ${selected ? 'var(--accent)' : tint}`,
           boxShadow: selected
             ? '0 4px 14px rgba(216, 80, 26, 0.45), 0 1px 2px rgba(0,0,0,0.2)'
             : '0 2px 6px rgba(0,0,0,0.25)',
-          fontSize: 15,
+          fontSize: 12,
+          letterSpacing: '-0.01em',
         }}
       >
-        {player.number || initials(player.name)}
+        <span className="truncate">{firstName(player.name)}</span>
       </div>
       <div
         className="px-1.5 py-px rounded text-[9px] font-bold tabular"
@@ -1053,19 +1675,19 @@ function EmptySlot({ role, onTap, canPlace }) {
 // BENCH
 // ===================================================================
 
-function Bench({ bench, playerById, playingTime, selectedPlayerId, onSelectPlayer, rosterCount }) {
+function Bench({ bench, playerById, playingTime, selectedPlayerId, onSelectPlayer, squadSize }) {
   const sorted = useMemo(() => {
     return [...bench]
       .map(id => ({ id, time: playingTime[id] || 0, player: playerById.get(id) }))
       .filter(x => x.player)
-      .sort((a, b) => a.time - b.time); // least played first
+      .sort((a, b) => a.time - b.time);
   }, [bench, playerById, playingTime]);
 
-  if (rosterCount === 0) {
+  if (squadSize === 0) {
     return (
       <div className="rounded-xl p-4 mb-3 text-center text-xs"
         style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)', color: 'var(--ink-muted)' }}>
-        Truppen är tom — lägg till spelare under "Trupp" först.
+        Ingen trupp för matchen — redigera matchen för att lägga till spelare.
       </div>
     );
   }
@@ -1101,6 +1723,7 @@ function Bench({ bench, playerById, playingTime, selectedPlayerId, onSelectPlaye
   );
 }
 
+// Bench chip — shows player FIRST NAME prominently on a pill (matches pitch chip style).
 function BenchChip({ player, seconds, selected, onTap }) {
   return (
     <button
@@ -1109,23 +1732,23 @@ function BenchChip({ player, seconds, selected, onTap }) {
       style={{
         background: selected ? 'var(--accent-soft)' : 'var(--surface)',
         border: `1.5px solid ${selected ? 'var(--accent)' : 'var(--border)'}`,
-        minWidth: 64,
+        minWidth: 76,
         scrollSnapAlign: 'start',
       }}
     >
       <div
-        className="rounded-full flex items-center justify-center display tabular font-bold"
+        className="rounded-full flex items-center justify-center display font-bold px-2"
         style={{
-          width: 32, height: 32,
+          minWidth: 60,
+          maxWidth: 72,
+          height: 28,
           background: selected ? 'var(--accent)' : 'var(--ink)',
           color: selected ? 'white' : 'var(--bg)',
-          fontSize: 14,
+          fontSize: 12,
+          letterSpacing: '-0.01em',
         }}
       >
-        {player.number || initials(player.name)}
-      </div>
-      <div className="text-[10px] font-semibold leading-tight max-w-[60px] truncate" style={{ color: 'var(--ink)' }}>
-        {player.name.split(' ')[0]}
+        <span className="truncate">{firstName(player.name)}</span>
       </div>
       <div className="text-[9px] tabular font-bold" style={{ color: selected ? 'var(--accent-strong)' : 'var(--ink-muted)' }}>
         {formatMin(seconds)}
@@ -1138,7 +1761,7 @@ function BenchChip({ player, seconds, selected, onTap }) {
 // EVENT ROW
 // ===================================================================
 
-function EventRow({ event, playerById, settings }) {
+function EventRow({ event, playerById, settings, opponentLabel }) {
   let icon, body;
   if (event.type === 'goal') {
     const isHome = event.team === 'home';
@@ -1146,20 +1769,20 @@ function EventRow({ event, playerById, settings }) {
     const scorer = playerById.get(event.scorerId);
     const assist = playerById.get(event.assistId);
     if (isHome && scorer) {
-      body = <span><strong>Mål</strong> · #{scorer.number} {scorer.name}{assist ? <span style={{ color: 'var(--ink-faint)' }}> (ass: #{assist.number} {assist.name})</span> : ''}</span>;
+      body = <span><strong>Mål</strong> · {scorer.name}{assist ? <span style={{ color: 'var(--ink-faint)' }}> (ass: {assist.name})</span> : ''}</span>;
     } else {
-      body = <span><strong>Mål</strong> · {isHome ? settings.homeTeam : settings.awayTeam}</span>;
+      body = <span><strong>Mål</strong> · {isHome ? settings.homeTeam : (opponentLabel || settings.awayTeam)}</span>;
     }
   } else if (event.type === 'card') {
     const c = CARD_TYPES.find(c => c.value === event.cardType);
     icon = <Square size={11} fill={c?.color} style={{ color: c?.color }} />;
     const p = playerById.get(event.playerId);
-    body = <span><strong>{c?.label}</strong>{p ? ` · #${p.number} ${p.name}` : ''}</span>;
+    body = <span><strong>{c?.label}</strong>{p ? ` · ${p.name}` : ''}</span>;
   } else if (event.type === 'sub') {
     icon = <ArrowLeftRight size={13} style={{ color: 'var(--ink-muted)' }} />;
     const out = playerById.get(event.outId);
     const inP = playerById.get(event.inId);
-    body = <span><strong>Byte</strong> · {out ? `#${out.number} ${out.name}` : '—'} ut, {inP ? `#${inP.number} ${inP.name}` : '—'} in</span>;
+    body = <span><strong>Byte</strong> · {out ? out.name : '—'} ut, {inP ? inP.name : '—'} in</span>;
   }
   return (
     <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-[12px]"
@@ -1174,18 +1797,30 @@ function EventRow({ event, playerById, settings }) {
 }
 
 // ===================================================================
-// TIME VIEW
+// STATS VIEW (combines playing time + per-player stats)
 // ===================================================================
 
-function TimeView({ game, roster, playerById }) {
-  const onField = new Set(game.lineup.filter(Boolean));
+function StatsView({ match, roster, settings, playerStats, playerById }) {
+  if (!match) {
+    return (
+      <div className="px-4 pt-12 text-center">
+        <div className="text-sm" style={{ color: 'var(--ink-muted)' }}>Ingen aktiv match.</div>
+      </div>
+    );
+  }
+
+  const onField = new Set(match.lineup.filter(Boolean));
+  const squadSet = new Set(match.squad);
+  // Only include players in the squad for this match's stats
+  const squadPlayers = roster.filter(p => squadSet.has(p.id));
+
   const playerData = useMemo(() => {
-    return roster.map(p => ({
+    return squadPlayers.map(p => ({
       ...p,
-      seconds: game.playingTime[p.id] || 0,
+      seconds: match.playingTime[p.id] || 0,
       onField: onField.has(p.id),
     })).sort((a, b) => b.seconds - a.seconds);
-  }, [roster, game.playingTime, game.lineup]);
+  }, [squadPlayers, match.playingTime, match.lineup]);
 
   const totals = useMemo(() => {
     const list = playerData.map(p => p.seconds);
@@ -1197,97 +1832,21 @@ function TimeView({ game, roster, playerById }) {
     };
   }, [playerData]);
 
-  return (
-    <div className="px-4 pt-5">
-      <h1 className="display text-3xl font-bold mb-1">Speltid</h1>
-      <div className="text-xs mb-4" style={{ color: 'var(--ink-muted)' }}>
-        Hur mycket varje spelare har spelat i den här matchen
-      </div>
+  const opponentLabel = match.opponent || settings.awayTeam;
+  const sortedByPoints = [...squadPlayers].sort((a, b) => {
+    const sa = playerStats[a.id] || {}; const sb = playerStats[b.id] || {};
+    return (sb.goals + sb.assists * 0.5) - (sa.goals + sa.assists * 0.5);
+  });
 
-      {playerData.length === 0 ? (
-        <div className="rounded-xl p-6 text-center text-sm" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)', color: 'var(--ink-muted)' }}>
-          Lägg till spelare under "Trupp"
-        </div>
-      ) : (
-        <div className="space-y-1.5">
-          {playerData.map(p => {
-            const pct = totals.max ? (p.seconds / totals.max) * 100 : 0;
-            return (
-              <div key={p.id}
-                className="relative overflow-hidden rounded-xl p-3 flex items-center gap-3"
-                style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
-              >
-                {/* Bar */}
-                <div className="absolute inset-y-0 left-0 transition-all" style={{
-                  width: `${pct}%`,
-                  background: p.onField ? 'rgba(216, 80, 26, 0.10)' : 'rgba(0,0,0,0.04)',
-                }} />
-                <div className="relative flex items-center gap-3 flex-1 min-w-0">
-                  <div className="display tabular font-bold w-7 text-center" style={{ color: 'var(--ink-muted)', fontSize: 14 }}>
-                    #{p.number || '?'}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold truncate" style={{ color: 'var(--ink)' }}>{p.name}</div>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ color: p.onField ? 'var(--accent)' : 'var(--ink-faint)' }}>
-                      {p.onField ? '● På plan' : 'Bänken'}
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="display tabular font-bold text-lg" style={{ color: 'var(--ink)' }}>
-                      {formatMin(p.seconds)}
-                    </div>
-                    <div className="text-[9px] tabular" style={{ color: 'var(--ink-faint)' }}>
-                      {Math.floor((p.seconds || 0) / 60)} min {String((p.seconds || 0) % 60).padStart(2, '0')}s
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {playerData.length > 1 && (
-        <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-          <Stat label="Mest" value={formatMin(totals.max)} />
-          <Stat label="Snitt" value={formatMin(totals.avg)} />
-          <Stat label="Minst" value={formatMin(totals.min)} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Stat({ label, value }) {
-  return (
-    <div className="rounded-xl p-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
-      <div className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--ink-faint)' }}>{label}</div>
-      <div className="display tabular text-xl font-bold" style={{ color: 'var(--ink)' }}>{value}</div>
-    </div>
-  );
-}
-
-// ===================================================================
-// STATS VIEW
-// ===================================================================
-
-function StatsView({ game, roster, settings, playerStats, playerById }) {
-  const sortedPlayers = useMemo(() =>
-    [...roster].sort((a, b) => {
-      const sa = playerStats[a.id] || {}; const sb = playerStats[b.id] || {};
-      return (sb.goals + sb.assists * 0.5) - (sa.goals + sa.assists * 0.5);
-    }), [roster, playerStats]);
-
-  const homeGoals = game.events.filter(e => e.type === 'goal' && e.team === 'home').length;
-  const awayGoals = game.events.filter(e => e.type === 'goal' && e.team === 'away').length;
-  const cards = game.events.filter(e => e.type === 'card').length;
-  const subs = game.events.filter(e => e.type === 'sub').length;
+  const homeGoals = match.events.filter(e => e.type === 'goal' && e.team === 'home').length;
+  const cards = match.events.filter(e => e.type === 'card').length;
+  const subs = match.events.filter(e => e.type === 'sub').length;
 
   return (
     <div className="px-4 pt-5">
       <h1 className="display text-3xl font-bold mb-1">Statistik</h1>
       <div className="text-xs mb-4" style={{ color: 'var(--ink-muted)' }}>
-        {settings.homeTeam} vs {settings.awayTeam}
+        {match.name} · {settings.homeTeam} vs {opponentLabel}
       </div>
 
       {/* Score summary */}
@@ -1295,15 +1854,15 @@ function StatsView({ game, roster, settings, playerStats, playerById }) {
         <div className="flex items-center justify-around">
           <div className="text-center">
             <div className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--ink-muted)' }}>Hemma</div>
-            <div className="display tabular text-5xl font-bold">{game.homeScore}</div>
+            <div className="display tabular text-5xl font-bold">{match.homeScore}</div>
           </div>
           <div className="text-center px-3" style={{ color: 'var(--ink-faint)' }}>
-            <div className="text-xs">Halvlek {game.half}</div>
-            <div className="display tabular text-sm font-bold mt-1">{formatClock(game.clockSeconds)}</div>
+            <div className="text-xs">Halvlek {match.half}</div>
+            <div className="display tabular text-sm font-bold mt-1">{formatClock(match.clockSeconds)}</div>
           </div>
           <div className="text-center">
             <div className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--ink-muted)' }}>Borta</div>
-            <div className="display tabular text-5xl font-bold">{game.awayScore}</div>
+            <div className="display tabular text-5xl font-bold">{match.awayScore}</div>
           </div>
         </div>
         <div className="grid grid-cols-3 gap-2 mt-4 pt-3" style={{ borderTop: '1px solid var(--border)' }}>
@@ -1313,14 +1872,70 @@ function StatsView({ game, roster, settings, playerStats, playerById }) {
         </div>
       </div>
 
-      {/* Player stats */}
+      {/* Playing time */}
+      <div className="mb-1 flex items-center justify-between px-1">
+        <h2 className="display text-lg font-bold">Speltid</h2>
+        <div className="text-[10px]" style={{ color: 'var(--ink-faint)' }}>
+          per spelare
+        </div>
+      </div>
+      {playerData.length === 0 ? (
+        <div className="rounded-xl p-6 text-center text-sm mb-4" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)', color: 'var(--ink-muted)' }}>
+          Ingen trupp i denna match
+        </div>
+      ) : (
+        <>
+          <div className="space-y-1.5 mb-3">
+            {playerData.map(p => {
+              const pct = totals.max ? (p.seconds / totals.max) * 100 : 0;
+              return (
+                <div key={p.id}
+                  className="relative overflow-hidden rounded-xl p-2.5 flex items-center gap-3"
+                  style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+                >
+                  <div className="absolute inset-y-0 left-0" style={{
+                    width: `${pct}%`,
+                    background: p.onField ? 'rgba(216, 80, 26, 0.10)' : 'rgba(0,0,0,0.04)',
+                  }} />
+                  <div className="relative flex items-center gap-3 flex-1 min-w-0">
+                    <div className="display tabular font-bold w-7 text-center" style={{ color: 'var(--ink-muted)', fontSize: 13 }}>
+                      #{p.number || '?'}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-semibold truncate" style={{ color: 'var(--ink)' }}>{p.name}</div>
+                      <div className="text-[10px] uppercase tracking-wider" style={{ color: p.onField ? 'var(--accent)' : 'var(--ink-faint)' }}>
+                        {p.onField ? '● På plan' : 'Bänken'}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="display tabular font-bold text-lg" style={{ color: 'var(--ink)' }}>
+                        {formatMin(p.seconds)}
+                      </div>
+                      <div className="text-[9px] tabular" style={{ color: 'var(--ink-faint)' }}>
+                        {Math.floor((p.seconds || 0) / 60)} min {String((p.seconds || 0) % 60).padStart(2, '0')}s
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center mb-5">
+            <Stat label="Mest" value={formatMin(totals.max)} />
+            <Stat label="Snitt" value={formatMin(totals.avg)} />
+            <Stat label="Minst" value={formatMin(totals.min)} />
+          </div>
+        </>
+      )}
+
+      {/* Per-player goals/cards */}
       <div className="rounded-2xl p-4" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
         <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: 'var(--ink-faint)' }}>
-          Spelarstatistik · {settings.homeTeam}
+          Mål · assist · kort
         </div>
-        {roster.length === 0 ? (
-          <div className="text-xs text-center py-4" style={{ color: 'var(--ink-muted)' }}>
-            Lägg till spelare under "Trupp"
+        {squadPlayers.length === 0 ? (
+          <div className="text-xs text-center py-2" style={{ color: 'var(--ink-muted)' }}>
+            Ingen trupp
           </div>
         ) : (
           <>
@@ -1330,7 +1945,7 @@ function StatsView({ game, roster, settings, playerStats, playerById }) {
               <div className="col-span-2 text-center">A</div>
               <div className="col-span-2 text-center">Kort</div>
             </div>
-            {sortedPlayers.map(p => {
+            {sortedByPoints.map(p => {
               const s = playerStats[p.id] || { goals: 0, assists: 0, yellow: 0, red: 0 };
               return (
                 <div key={p.id} className="grid grid-cols-12 items-center py-2 px-1 text-sm" style={{ borderBottom: '1px solid var(--border)' }}>
@@ -1363,6 +1978,15 @@ function MiniStat({ label, value }) {
   );
 }
 
+function Stat({ label, value }) {
+  return (
+    <div className="rounded-xl p-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+      <div className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--ink-faint)' }}>{label}</div>
+      <div className="display tabular text-xl font-bold" style={{ color: 'var(--ink)' }}>{value}</div>
+    </div>
+  );
+}
+
 // ===================================================================
 // ROSTER VIEW
 // ===================================================================
@@ -1377,7 +2001,7 @@ function RosterView({ roster, onAdd, onUpdate, onRemove }) {
       <div className="flex items-center justify-between mb-5">
         <div>
           <h1 className="display text-3xl font-bold">Trupp</h1>
-          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>{roster.length} spelare</div>
+          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>{roster.length} spelare totalt</div>
         </div>
         <button
           onClick={() => setAdding(true)}
@@ -1388,12 +2012,16 @@ function RosterView({ roster, onAdd, onUpdate, onRemove }) {
         </button>
       </div>
 
+      <div className="text-xs mb-4 px-3 py-2 rounded-lg" style={{ background: 'var(--surface)', color: 'var(--ink-muted)', border: '1px solid var(--border)' }}>
+        Här är hela truppen. Välj <strong>vilka som spelar varje match</strong> under "Matcher".
+      </div>
+
       {roster.length === 0 && !adding && (
         <div className="rounded-2xl p-8 text-center" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
           <Users size={28} className="mx-auto mb-3" style={{ color: 'var(--ink-faint)' }} />
           <div className="text-sm font-semibold mb-1">Truppen är tom</div>
           <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
-            Lägg till spelare för att kunna sätta laget och tracka speltid
+            Lägg till spelare innan du sätter ihop en match
           </div>
         </div>
       )}
@@ -1507,7 +2135,7 @@ function PlayerForm({ initial, onSave, onCancel, onRemove }) {
 // SETTINGS VIEW
 // ===================================================================
 
-function SettingsView({ settings, onChange, onAskReset }) {
+function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
   const set = (k, v) => onChange({ ...settings, [k]: v });
   return (
     <div className="px-4 pt-5">
@@ -1524,27 +2152,32 @@ function SettingsView({ settings, onChange, onAskReset }) {
           />
         </div>
         <div>
-          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Bortalag</label>
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-2" style={{ color: 'var(--ink-faint)' }}>Standard motståndare</label>
           <input
             value={settings.awayTeam}
             onChange={e => set('awayTeam', e.target.value)}
             className="w-full px-3 py-2.5 rounded-lg outline-none"
             style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
           />
+          <div className="text-[11px] mt-1" style={{ color: 'var(--ink-faint)' }}>
+            Används om matchen inte har en egen motståndare angiven.
+          </div>
         </div>
       </div>
 
-      <button
-        onClick={onAskReset}
-        className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2"
-        style={{ border: '1px solid rgba(220, 38, 38, 0.4)', color: '#b91c1c' }}
-      >
-        <RotateCcw size={14} /> Återställ pågående match
-      </button>
+      {hasActiveMatch && (
+        <button
+          onClick={onAskReset}
+          className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2"
+          style={{ border: '1px solid rgba(220, 38, 38, 0.4)', color: '#b91c1c' }}
+        >
+          <RotateCcw size={14} /> Återställ aktuell match
+        </button>
+      )}
 
       <div className="text-center text-[10px] mt-8 leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
-        Knatte Coach · v0.1<br/>
-        Prototyp för iteration
+        Knatte Coach · v0.2<br/>
+        Multipla matcher + namn på brickor
       </div>
     </div>
   );
@@ -1556,8 +2189,8 @@ function SettingsView({ settings, onChange, onAskReset }) {
 
 function BottomNav({ view, setView }) {
   const items = [
-    { id: 'match', icon: Activity, label: 'Match' },
-    { id: 'time', icon: Clock, label: 'Speltid' },
+    { id: 'matches', icon: Calendar, label: 'Matcher' },
+    { id: 'match', icon: Activity, label: 'Live' },
     { id: 'stats', icon: BarChart3, label: 'Stats' },
     { id: 'roster', icon: Users, label: 'Trupp' },
     { id: 'settings', icon: SettingsIcon, label: 'Inst.' },
@@ -1580,10 +2213,7 @@ function BottomNav({ view, setView }) {
                 key={it.id}
                 onClick={() => setView(it.id)}
                 className="flex flex-col items-center justify-center py-2 rounded-xl text-[9px] font-bold uppercase tracking-wider gap-0.5"
-                style={{
-                  background: active ? 'var(--ink)' : 'transparent',
-                  color: active ? 'var(--bg)' : 'var(--ink-muted)',
-                }}
+                style={{ background: active ? 'var(--ink)' : 'transparent', color: active ? 'var(--bg)' : 'var(--ink-muted)' }}
               >
                 <Icon size={16} />
                 {it.label}
@@ -1662,14 +2292,11 @@ function FormatPickerModal({ format, formationName, onSetFormat, onSetFormation,
             <div className="relative w-full" style={{ aspectRatio: '1 / 1.1', background: 'var(--pitch-green)' }}>
               <PitchMarkings />
               {f.positions.map((pos, i) => (
-                <div key={i} className="absolute rounded-full"
-                  style={{
-                    width: 10, height: 10,
-                    left: `${pos.x * 100}%`, top: `${pos.y * 100}%`,
-                    background: 'white',
-                    transform: 'translate(-50%, -50%)',
-                    border: '1px solid rgba(0,0,0,0.2)',
-                  }} />
+                <div key={i} className="absolute rounded-full" style={{
+                  width: 10, height: 10,
+                  left: `${pos.x * 100}%`, top: `${pos.y * 100}%`,
+                  background: 'white', transform: 'translate(-50%, -50%)', border: '1px solid rgba(0,0,0,0.2)',
+                }} />
               ))}
             </div>
             <div className="px-3 py-2 flex items-center justify-between">
@@ -1679,15 +2306,11 @@ function FormatPickerModal({ format, formationName, onSetFormat, onSetFormation,
           </button>
         ))}
       </div>
-
-      <div className="text-[11px] mt-2" style={{ color: 'var(--ink-faint)' }}>
-        Tip: byt mitt under match — spelarna behåller sin ordning men får nya positioner.
-      </div>
     </ModalShell>
   );
 }
 
-function GoalModal({ team, settings, game, playerById, onClose, onSave }) {
+function GoalModal({ team, settings, match, playerById, onClose, onSave }) {
   const [scorerId, setScorerId] = useState(null);
   const [assistId, setAssistId] = useState(null);
 
@@ -1695,7 +2318,7 @@ function GoalModal({ team, settings, game, playerById, onClose, onSave }) {
     return (
       <ModalShell title="Mål för motståndare" onClose={onClose}>
         <div className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>
-          Lägg till mål för {settings.awayTeam}? Bortalagets spelarstatistik registreras inte.
+          Lägg till mål för {match.opponent || settings.awayTeam}? Bortalagets spelarstatistik registreras inte.
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="flex-1 py-3 rounded-xl text-sm font-semibold" style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}>Avbryt</button>
@@ -1707,31 +2330,27 @@ function GoalModal({ team, settings, game, playerById, onClose, onSave }) {
     );
   }
 
-  // Home goal — pick scorer + assist from current lineup
-  const onFieldPlayers = game.lineup.filter(Boolean).map(id => playerById.get(id)).filter(Boolean);
-  const allRosterPlayers = [
-    ...onFieldPlayers,
-    ...game.bench.map(id => playerById.get(id)).filter(Boolean),
-  ];
+  // Home goal — pick scorer + assist from this match's squad
+  const squadPlayers = match.squad.map(id => playerById.get(id)).filter(Boolean);
 
   return (
     <ModalShell title="Mål för oss" onClose={onClose}>
       <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: 'var(--ink-faint)' }}>Målskytt</div>
-      {allRosterPlayers.length === 0 ? (
+      {squadPlayers.length === 0 ? (
         <div className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>
-          Inga spelare i truppen.
+          Ingen trupp för matchen.
         </div>
       ) : (
-        <div className="grid grid-cols-4 gap-1.5 mb-4">
-          {allRosterPlayers.map(p => (
+        <div className="grid grid-cols-3 gap-1.5 mb-4">
+          {squadPlayers.map(p => (
             <PlayerPickButton key={p.id} player={p} selected={scorerId === p.id} disabled={assistId === p.id} onClick={() => setScorerId(scorerId === p.id ? null : p.id)} />
           ))}
         </div>
       )}
 
       <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: 'var(--ink-faint)' }}>Assist (valfritt)</div>
-      <div className="grid grid-cols-4 gap-1.5 mb-5">
-        {allRosterPlayers.map(p => (
+      <div className="grid grid-cols-3 gap-1.5 mb-5">
+        {squadPlayers.map(p => (
           <PlayerPickButton key={p.id} player={p} selected={assistId === p.id} disabled={scorerId === p.id} onClick={() => setAssistId(assistId === p.id ? null : p.id)} />
         ))}
       </div>
@@ -1753,10 +2372,11 @@ function GoalModal({ team, settings, game, playerById, onClose, onSave }) {
   );
 }
 
-function CardModal({ game, roster, onClose, onSave }) {
+function CardModal({ match, playerById, onClose, onSave }) {
   const [cardType, setCardType] = useState('yellow');
   const [playerId, setPlayerId] = useState(null);
-  const sorted = [...roster].sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
+  const squadPlayers = match.squad.map(id => playerById.get(id)).filter(Boolean)
+    .sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
 
   return (
     <ModalShell title="Kort" onClose={onClose}>
@@ -1780,11 +2400,11 @@ function CardModal({ game, roster, onClose, onSave }) {
       </div>
 
       <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: 'var(--ink-faint)' }}>Spelare (valfritt)</div>
-      {sorted.length === 0 ? (
-        <div className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>Inga spelare i truppen.</div>
+      {squadPlayers.length === 0 ? (
+        <div className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>Ingen trupp för matchen.</div>
       ) : (
-        <div className="grid grid-cols-4 gap-1.5 mb-5">
-          {sorted.map(p => (
+        <div className="grid grid-cols-3 gap-1.5 mb-5">
+          {squadPlayers.map(p => (
             <PlayerPickButton key={p.id} player={p} selected={playerId === p.id} onClick={() => setPlayerId(playerId === p.id ? null : p.id)} />
           ))}
         </div>
@@ -1819,10 +2439,12 @@ function PlayerPickButton({ player, selected, disabled, onClick }) {
         color: 'var(--ink)',
       }}
     >
-      <span className="display tabular text-base font-bold leading-none">
-        {player.number ? `#${player.number}` : initials(player.name)}
+      <span className="text-sm font-bold leading-tight truncate max-w-full">
+        {firstName(player.name)}
       </span>
-      <span className="text-[10px] truncate max-w-full leading-tight">{player.name.split(' ')[0]}</span>
+      <span className="text-[10px] tabular" style={{ color: 'var(--ink-muted)' }}>
+        {player.number ? `#${player.number}` : ''}
+      </span>
     </button>
   );
 }
