@@ -13,6 +13,7 @@ import {
 const STORAGE_KEYS = {
   settings: 'app:settings',
   roster: 'app:roster',
+  coaches: 'app:coaches',
   matches: 'app:matches',
   activeMatchId: 'app:activeMatchId',
   // Old key, only read for migration
@@ -255,7 +256,38 @@ const firstName = (name) => {
   return name.trim().split(/\s+/)[0];
 };
 
-function makeNewMatch({ format = '7v7', name, opponent = '', squad = [], existingNames = [] } = {}) {
+// Format ISO datetime string for display: "lör 27 apr · 14:30"
+function formatKickoff(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const days = ['sön', 'mån', 'tis', 'ons', 'tor', 'fre', 'lör'];
+  const months = ['jan', 'feb', 'mar', 'apr', 'maj', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
+  const day = days[d.getDay()];
+  const date = d.getDate();
+  const month = months[d.getMonth()];
+  const hours = String(d.getHours()).padStart(2, '0');
+  const mins = String(d.getMinutes()).padStart(2, '0');
+  return `${day} ${date} ${month} · ${hours}:${mins}`;
+}
+
+// Format kickoff for HTML datetime-local input ("YYYY-MM-DDTHH:MM")
+function formatKickoffForInput(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Parse datetime-local input value back to ISO
+function parseKickoffFromInput(val) {
+  if (!val) return null;
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function makeNewMatch({ format = '7v7', name, opponent = '', squad = [], coaches = [], kickoffAt = null, venue = '', existingNames = [] } = {}) {
   const def = FORMATS[format];
   // Auto-generate name like "Match 1", "Match 2" if not provided
   let resolvedName = name;
@@ -278,10 +310,13 @@ function makeNewMatch({ format = '7v7', name, opponent = '', squad = [], existin
     id: uid(),
     name: resolvedName,
     opponent,
+    kickoffAt,        // ISO string or null
+    venue,            // free text
     format,
     formationName: def.formations[0].name,
     halfMinutes: def.halfMinutes,
     squad: [...squad],
+    coaches: [...coaches],
     lineup,
     bench,
     homeScore: 0,
@@ -289,6 +324,7 @@ function makeNewMatch({ format = '7v7', name, opponent = '', squad = [], existin
     half: 1,
     clockSeconds: 0,
     clockRunning: false,
+    clockEpochAt: null,
     events: [],
     playingTime: {},
     createdAt: Date.now(),
@@ -302,6 +338,63 @@ function getFormation(format, formationName) {
 }
 
 // ===================================================================
+// CLOCK HELPERS — wall-clock based timing that survives backgrounding
+// ===================================================================
+
+// Live match clock (seconds): base + elapsed since current epoch if running.
+function getLiveClockSeconds(match) {
+  if (!match) return 0;
+  const base = match.clockSeconds || 0;
+  if (!match.clockRunning || !match.clockEpochAt) return base;
+  const elapsed = Math.floor((Date.now() - match.clockEpochAt) / 1000);
+  return base + Math.max(0, elapsed);
+}
+
+// Live playing time (seconds) for one player: only on-field players accrue.
+function getLivePlayerSeconds(match, playerId) {
+  if (!match) return 0;
+  const base = (match.playingTime && match.playingTime[playerId]) || 0;
+  if (!match.clockRunning || !match.clockEpochAt) return base;
+  if (!match.lineup.includes(playerId)) return base;
+  const elapsed = Math.floor((Date.now() - match.clockEpochAt) / 1000);
+  return base + Math.max(0, elapsed);
+}
+
+// Compute a fresh "playingTime" map containing live values for every player.
+function getLivePlayingTime(match) {
+  if (!match) return {};
+  const result = { ...(match.playingTime || {}) };
+  if (match.clockRunning && match.clockEpochAt) {
+    const elapsed = Math.floor((Date.now() - match.clockEpochAt) / 1000);
+    if (elapsed > 0) {
+      match.lineup.forEach(id => {
+        if (id) result[id] = (result[id] || 0) + elapsed;
+      });
+    }
+  }
+  return result;
+}
+
+// Roll any pending elapsed time into base values, return updated match.
+// Use before pausing, substituting, going to next half, etc.
+function consolidateClock(match) {
+  if (!match.clockRunning || !match.clockEpochAt) return match;
+  const now = Date.now();
+  const elapsed = Math.floor((now - match.clockEpochAt) / 1000);
+  if (elapsed <= 0) return { ...match, clockEpochAt: now };
+  const newPlayingTime = { ...(match.playingTime || {}) };
+  match.lineup.forEach(id => {
+    if (id) newPlayingTime[id] = (newPlayingTime[id] || 0) + elapsed;
+  });
+  return {
+    ...match,
+    clockSeconds: (match.clockSeconds || 0) + elapsed,
+    playingTime: newPlayingTime,
+    clockEpochAt: now, // reset epoch so we don't double-count
+  };
+}
+
+// ===================================================================
 // MAIN COMPONENT
 // ===================================================================
 
@@ -309,6 +402,7 @@ export default function FootballCoachApp() {
   const [view, setView] = useState('match');
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [roster, setRoster] = useState([]);
+  const [coaches, setCoaches] = useState([]);
   const [matches, setMatches] = useState([]);
   const [activeMatchId, setActiveMatchId] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -351,6 +445,11 @@ export default function FootballCoachApp() {
         const r = await window.storage.get(STORAGE_KEYS.roster).catch(() => null);
         if (r?.value) { loadedRoster = JSON.parse(r.value); setRoster(loadedRoster); }
       } catch (e) {}
+      // Coaches
+      try {
+        const c = await window.storage.get(STORAGE_KEYS.coaches).catch(() => null);
+        if (c?.value) setCoaches(JSON.parse(c.value));
+      } catch (e) {}
       // Matches — try new format first
       let loadedMatches = null;
       try {
@@ -382,6 +481,7 @@ export default function FootballCoachApp() {
               half: oldGame.half || 1,
               clockSeconds: oldGame.clockSeconds || 0,
               clockRunning: false,
+              clockEpochAt: null,
               events: oldGame.events || [],
               playingTime: oldGame.playingTime || {},
               createdAt: oldGame.startedAt || Date.now(),
@@ -392,6 +492,15 @@ export default function FootballCoachApp() {
       }
       // Default: empty matches list — first match is created on demand
       if (!loadedMatches) loadedMatches = [];
+      // Normalize: clock always paused on load, epoch reset, ensure new fields exist
+      loadedMatches = loadedMatches.map(m => ({
+        ...m,
+        clockRunning: false,
+        clockEpochAt: null,
+        coaches: m.coaches || [],
+        kickoffAt: m.kickoffAt || null,
+        venue: m.venue || '',
+      }));
       setMatches(loadedMatches);
       // Active match id
       try {
@@ -417,6 +526,10 @@ export default function FootballCoachApp() {
   }, [roster, loaded]);
   useEffect(() => {
     if (!loaded || !window.storage) return;
+    window.storage.set(STORAGE_KEYS.coaches, JSON.stringify(coaches)).catch(() => {});
+  }, [coaches, loaded]);
+  useEffect(() => {
+    if (!loaded || !window.storage) return;
     // Pause clocks when serializing
     const toSave = matches.map(m => ({ ...m, clockRunning: false }));
     window.storage.set(STORAGE_KEYS.matches, JSON.stringify(toSave)).catch(() => {});
@@ -426,25 +539,49 @@ export default function FootballCoachApp() {
     window.storage.set(STORAGE_KEYS.activeMatchId, activeMatchId || '').catch(() => {});
   }, [activeMatchId, loaded]);
 
-  // ----- Clock tick (only the active match's clock can run) -----
+  // ----- Re-render trigger so the clock display updates every second -----
+  // The actual time math is wall-clock based via clockEpochAt, so this only
+  // forces React to re-read Date.now(); it never increments any value itself.
+  // This means iOS pausing the timer in background causes no time loss.
+  const [, setTickCounter] = useState(0);
   useEffect(() => {
     if (!activeMatch?.clockRunning) return;
-    const interval = setInterval(() => {
-      setMatches(ms => ms.map(m => {
-        if (m.id !== activeMatchId) return m;
-        const newPT = { ...m.playingTime };
-        m.lineup.forEach(pid => {
-          if (pid) newPT[pid] = (newPT[pid] || 0) + 1;
-        });
-        return {
-          ...m,
-          clockSeconds: m.clockSeconds + 1,
-          playingTime: newPT,
-          startedAt: m.startedAt || Date.now(),
-        };
-      }));
-    }, 1000);
-    return () => clearInterval(interval);
+    const tick = () => setTickCounter(c => (c + 1) & 0xffff);
+    const interval = setInterval(tick, 1000);
+    const onVisibility = () => { if (!document.hidden) tick(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [activeMatch?.clockRunning, activeMatchId]);
+
+  // ----- Wake Lock: keep the screen awake while the clock is running -----
+  // iOS releases the lock automatically when the app goes to background.
+  // We re-acquire on visibilitychange so it kicks back in when you return.
+  useEffect(() => {
+    if (!activeMatch?.clockRunning) return;
+    if (typeof navigator === 'undefined' || !('wakeLock' in navigator)) return;
+    let released = false;
+    let lock = null;
+    const acquire = async () => {
+      try {
+        lock = await navigator.wakeLock.request('screen');
+        lock.addEventListener?.('release', () => { lock = null; });
+      } catch (e) { /* user interaction may be required, ignore */ }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && !released && !lock) {
+        acquire();
+      }
+    };
+    acquire();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      released = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (lock) { try { lock.release(); } catch (e) {} lock = null; }
+    };
   }, [activeMatch?.clockRunning, activeMatchId]);
 
   // ----- Sync roster ↔ active match's squad -----
@@ -464,6 +601,17 @@ export default function FootballCoachApp() {
     }));
   }, [roster, loaded]);
 
+  // ----- Sync coaches ↔ matches' coach lists -----
+  useEffect(() => {
+    if (!loaded) return;
+    const coachIds = new Set(coaches.map(c => c.id));
+    setMatches(ms => ms.map(m => {
+      const matchCoaches = (m.coaches || []).filter(id => coachIds.has(id));
+      if (matchCoaches.length === (m.coaches || []).length) return m;
+      return { ...m, coaches: matchCoaches };
+    }));
+  }, [coaches, loaded]);
+
   // ============== HELPERS TO MUTATE ACTIVE MATCH ==============
 
   const updateActiveMatch = (updater) => {
@@ -481,7 +629,10 @@ export default function FootballCoachApp() {
       format: config?.format || activeMatch?.format || '7v7',
       name: config?.name,
       opponent: config?.opponent || '',
+      kickoffAt: config?.kickoffAt ?? null,
+      venue: config?.venue || '',
       squad: config?.squad ?? defaultSquad,
+      coaches: config?.coaches ?? [],
       existingNames,
     });
     setMatches(ms => [...ms, newMatch]);
@@ -566,6 +717,7 @@ export default function FootballCoachApp() {
       half: 1,
       clockSeconds: 0,
       clockRunning: false,
+      clockEpochAt: null,
       events: [],
       playingTime: {},
       createdAt: Date.now(),
@@ -576,8 +728,12 @@ export default function FootballCoachApp() {
   };
 
   const switchActiveMatch = (matchId) => {
-    // Pause any currently running match
-    setMatches(ms => ms.map(m => m.clockRunning ? { ...m, clockRunning: false } : m));
+    // Pause + consolidate any currently running match before switching away.
+    setMatches(ms => ms.map(m => {
+      if (!m.clockRunning) return m;
+      const consolidated = consolidateClock(m);
+      return { ...consolidated, clockRunning: false, clockEpochAt: null };
+    }));
     setActiveMatchId(matchId);
     setSelectedPlayerId(null);
     setView('match');
@@ -599,6 +755,7 @@ export default function FootballCoachApp() {
       half: 1,
       clockSeconds: 0,
       clockRunning: false,
+      clockEpochAt: null,
       events: [],
       playingTime: {},
       startedAt: null,
@@ -609,9 +766,41 @@ export default function FootballCoachApp() {
 
   // ============== ACTIVE MATCH ACTIONS ==============
 
-  const toggleClock = () => updateActiveMatch(m => ({ ...m, clockRunning: !m.clockRunning }));
-  const adjustClock = (delta) => updateActiveMatch(m => ({ ...m, clockSeconds: Math.max(0, m.clockSeconds + delta) }));
-  const goNextHalf = () => updateActiveMatch(m => ({ ...m, half: m.half + 1, clockSeconds: 0, clockRunning: false }));
+  const toggleClock = () => updateActiveMatch(m => {
+    if (m.clockRunning) {
+      // Pause: roll elapsed time into base, drop epoch.
+      const consolidated = consolidateClock(m);
+      return { ...consolidated, clockRunning: false, clockEpochAt: null };
+    }
+    // Start: mark wall-clock starting point, no base change.
+    return {
+      ...m,
+      clockRunning: true,
+      clockEpochAt: Date.now(),
+      startedAt: m.startedAt || Date.now(),
+    };
+  });
+
+  const adjustClock = (delta) => updateActiveMatch(m => {
+    // Consolidate first so we never lose pending elapsed time, then nudge.
+    const consolidated = consolidateClock(m);
+    return {
+      ...consolidated,
+      clockSeconds: Math.max(0, (consolidated.clockSeconds || 0) + delta),
+    };
+  });
+
+  const goNextHalf = () => updateActiveMatch(m => {
+    // Consolidate so the half's playing time is preserved before resetting clock.
+    const consolidated = consolidateClock(m);
+    return {
+      ...consolidated,
+      half: m.half + 1,
+      clockSeconds: 0,
+      clockRunning: false,
+      clockEpochAt: null,
+    };
+  });
 
   const setFormation = (formationName) => {
     updateActiveMatch(m => ({ ...m, formationName }));
@@ -628,8 +817,10 @@ export default function FootballCoachApp() {
   const tapEmptyPosition = (positionIndex) => {
     if (!selectedPlayerId) return;
     updateActiveMatch(m => {
-      const newLineup = [...m.lineup];
-      const newBench = [...m.bench];
+      // Capture any pending elapsed time before changing the lineup.
+      const m2 = consolidateClock(m);
+      const newLineup = [...m2.lineup];
+      const newBench = [...m2.bench];
       const fromLineupIdx = newLineup.indexOf(selectedPlayerId);
       if (fromLineupIdx !== -1) {
         newLineup[fromLineupIdx] = null;
@@ -638,24 +829,26 @@ export default function FootballCoachApp() {
         if (benchIdx !== -1) newBench.splice(benchIdx, 1);
       }
       newLineup[positionIndex] = selectedPlayerId;
-      return { ...m, lineup: newLineup, bench: newBench };
+      return { ...m2, lineup: newLineup, bench: newBench };
     });
     setSelectedPlayerId(null);
   };
 
   const swapPlayers = (id1, id2) => {
     updateActiveMatch(m => {
-      const newLineup = [...m.lineup];
-      const newBench = [...m.bench];
+      // Consolidate first so on-field time up to this moment is preserved.
+      const m2 = consolidateClock(m);
+      const newLineup = [...m2.lineup];
+      const newBench = [...m2.bench];
       const i1 = newLineup.indexOf(id1);
       const i2 = newLineup.indexOf(id2);
       const onField1 = i1 !== -1, onField2 = i2 !== -1;
 
       if (onField1 && onField2) {
         newLineup[i1] = id2; newLineup[i2] = id1;
-        return { ...m, lineup: newLineup, bench: newBench };
+        return { ...m2, lineup: newLineup, bench: newBench };
       }
-      if (!onField1 && !onField2) return m;
+      if (!onField1 && !onField2) return m2;
       const fieldId = onField1 ? id1 : id2;
       const benchId = onField1 ? id2 : id1;
       const fieldPos = onField1 ? i1 : i2;
@@ -664,10 +857,10 @@ export default function FootballCoachApp() {
       if (benchIdx !== -1) newBench.splice(benchIdx, 1);
       newBench.push(fieldId);
       const newEvent = {
-        id: uid(), type: 'sub', time: m.clockSeconds, half: m.half,
+        id: uid(), type: 'sub', time: getLiveClockSeconds(m2), half: m2.half,
         outId: fieldId, inId: benchId, ts: Date.now(),
       };
-      return { ...m, lineup: newLineup, bench: newBench, events: [newEvent, ...m.events] };
+      return { ...m2, lineup: newLineup, bench: newBench, events: [newEvent, ...m2.events] };
     });
   };
 
@@ -677,7 +870,7 @@ export default function FootballCoachApp() {
       [team === 'home' ? 'homeScore' : 'awayScore']: m[team === 'home' ? 'homeScore' : 'awayScore'] + 1,
       events: [{
         id: uid(), type: 'goal', team, scorerId, assistId,
-        time: m.clockSeconds, half: m.half, ts: Date.now(),
+        time: getLiveClockSeconds(m), half: m.half, ts: Date.now(),
       }, ...m.events],
     }));
     setGoalModalOpen(null);
@@ -688,7 +881,7 @@ export default function FootballCoachApp() {
       ...m,
       events: [{
         id: uid(), type: 'card', playerId, cardType,
-        time: m.clockSeconds, half: m.half, ts: Date.now(),
+        time: getLiveClockSeconds(m), half: m.half, ts: Date.now(),
       }, ...m.events],
     }));
     setCardModalOpen(false);
@@ -713,11 +906,22 @@ export default function FootballCoachApp() {
   const updatePlayer = (id, updates) => setRoster(r => r.map(p => p.id === id ? { ...p, ...updates } : p));
   const removePlayer = (id) => setRoster(r => r.filter(p => p.id !== id));
 
+  // Coach ops
+  const addCoach = (coach) => setCoaches(c => [...c, { id: uid(), ...coach }]);
+  const updateCoach = (id, updates) => setCoaches(c => c.map(x => x.id === id ? { ...x, ...updates } : x));
+  const removeCoach = (id) => setCoaches(c => c.filter(x => x.id !== id));
+
   const playerById = useMemo(() => {
     const map = new Map();
     roster.forEach(p => map.set(p.id, p));
     return map;
   }, [roster]);
+
+  const coachById = useMemo(() => {
+    const map = new Map();
+    coaches.forEach(c => map.set(c.id, c));
+    return map;
+  }, [coaches]);
 
   const playerStats = useMemo(() => {
     const s = {};
@@ -756,6 +960,7 @@ export default function FootballCoachApp() {
           <MatchSetupView
             match={editingMatch}
             roster={roster}
+            coaches={coaches}
             existingNames={matches.filter(m => m.id !== editingMatch?.id).map(m => m.name)}
             onCancel={() => setEditingMatchId(null)}
             onSave={(config) => {
@@ -800,6 +1005,7 @@ export default function FootballCoachApp() {
             activeMatchId={activeMatchId}
             settings={settings}
             roster={roster}
+            coachById={coachById}
             onOpen={(id) => switchActiveMatch(id)}
             onEdit={(id) => setEditingMatchId(id)}
             onCreate={() => setEditingMatchId('new')}
@@ -813,6 +1019,7 @@ export default function FootballCoachApp() {
               match={activeMatch}
               roster={roster}
               playerById={playerById}
+              coachById={coachById}
               selectedPlayerId={selectedPlayerId}
               onSelectPlayer={tapPlayer}
               onTapEmpty={tapEmptyPosition}
@@ -835,7 +1042,16 @@ export default function FootballCoachApp() {
           <StatsView match={activeMatch} roster={roster} settings={settings} playerStats={playerStats} playerById={playerById} />
         )}
         {view === 'roster' && (
-          <RosterView roster={roster} onAdd={addPlayer} onUpdate={updatePlayer} onRemove={removePlayer} />
+          <RosterView
+            roster={roster}
+            coaches={coaches}
+            onAdd={addPlayer}
+            onUpdate={updatePlayer}
+            onRemove={removePlayer}
+            onAddCoach={addCoach}
+            onUpdateCoach={updateCoach}
+            onRemoveCoach={removeCoach}
+          />
         )}
         {view === 'settings' && (
           <SettingsView settings={settings} onChange={setSettings} onAskReset={() => setConfirmReset(true)} hasActiveMatch={!!activeMatch} />
@@ -954,8 +1170,15 @@ function NoMatchEmptyState({ onCreate, hasRoster }) {
 // MATCHES LIST VIEW
 // ===================================================================
 
-function MatchesListView({ matches, activeMatchId, settings, roster, onOpen, onEdit, onCreate, onDuplicate }) {
-  const sorted = [...matches].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+function MatchesListView({ matches, activeMatchId, settings, roster, coachById, onOpen, onEdit, onCreate, onDuplicate }) {
+  // Sort: matches with kickoff time first (chronological); matches without time last (by createdAt desc)
+  const sorted = useMemo(() => {
+    const withTime = matches.filter(m => m.kickoffAt);
+    const withoutTime = matches.filter(m => !m.kickoffAt);
+    withTime.sort((a, b) => new Date(a.kickoffAt).getTime() - new Date(b.kickoffAt).getTime());
+    withoutTime.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return [...withTime, ...withoutTime];
+  }, [matches]);
 
   return (
     <div className="px-4 pt-5">
@@ -992,6 +1215,7 @@ function MatchesListView({ matches, activeMatchId, settings, roster, onOpen, onE
               isActive={m.id === activeMatchId}
               settings={settings}
               roster={roster}
+              coachById={coachById}
               onOpen={() => onOpen(m.id)}
               onEdit={() => onEdit(m.id)}
               onDuplicate={() => onDuplicate(m.id)}
@@ -1003,10 +1227,16 @@ function MatchesListView({ matches, activeMatchId, settings, roster, onOpen, onE
   );
 }
 
-function MatchCard({ match, isActive, settings, roster, onOpen, onEdit, onDuplicate }) {
+function MatchCard({ match, isActive, settings, roster, coachById, onOpen, onEdit, onDuplicate }) {
   const fmt = FORMATS[match.format];
-  const isStarted = match.events.length > 0 || match.clockSeconds > 0 || match.homeScore > 0 || match.awayScore > 0;
+  // Live clock — for the active running match this updates each render.
+  const liveClock = getLiveClockSeconds(match);
+  const isStarted = match.events.length > 0 || liveClock > 0 || match.homeScore > 0 || match.awayScore > 0;
   const opponentLabel = match.opponent || settings.awayTeam;
+  const kickoff = formatKickoff(match.kickoffAt);
+  const matchCoaches = (match.coaches || [])
+    .map(id => coachById?.get(id))
+    .filter(Boolean);
   return (
     <div
       className="rounded-xl overflow-hidden"
@@ -1017,7 +1247,7 @@ function MatchCard({ match, isActive, settings, roster, onOpen, onEdit, onDuplic
     >
       <button onClick={onOpen} className="w-full text-left p-3 flex items-center gap-3">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-0.5">
+          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
             {isActive && (
               <span className="text-[9px] uppercase tracking-widest font-bold px-1.5 py-px rounded"
                 style={{ background: 'var(--accent)', color: 'white' }}>
@@ -1028,16 +1258,28 @@ function MatchCard({ match, isActive, settings, roster, onOpen, onEdit, onDuplic
               {match.name}
             </div>
           </div>
+          {(kickoff || match.venue) && (
+            <div className="flex items-center gap-1.5 mb-0.5 text-[11px] font-semibold" style={{ color: 'var(--ink)' }}>
+              {kickoff && <><Clock size={11} style={{ color: 'var(--ink-muted)' }} /><span>{kickoff}</span></>}
+              {kickoff && match.venue && <span style={{ color: 'var(--ink-faint)' }}>·</span>}
+              {match.venue && <span className="truncate">{match.venue}</span>}
+            </div>
+          )}
           <div className="text-xs truncate" style={{ color: 'var(--ink-muted)' }}>
             vs {opponentLabel} · {fmt.label} · {match.formationName} · {match.squad.length} i trupp
           </div>
+          {matchCoaches.length > 0 && (
+            <div className="text-[11px] truncate mt-0.5" style={{ color: 'var(--ink-faint)' }}>
+              {matchCoaches.length === 1 ? 'Tränare' : 'Tränare'}: {matchCoaches.map(c => c.name).join(', ')}
+            </div>
+          )}
           {isStarted ? (
             <div className="flex items-center gap-2 mt-1.5 text-xs">
               <span className="display tabular font-bold" style={{ color: 'var(--ink)' }}>
                 {match.homeScore}–{match.awayScore}
               </span>
               <span style={{ color: 'var(--ink-faint)' }}>
-                · halvlek {match.half} · {formatClock(match.clockSeconds)}
+                · halvlek {match.half} · {formatClock(liveClock)}
               </span>
             </div>
           ) : (
@@ -1072,10 +1314,12 @@ function MatchCard({ match, isActive, settings, roster, onOpen, onEdit, onDuplic
 // MATCH SETUP VIEW (create / edit)
 // ===================================================================
 
-function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDelete }) {
+function MatchSetupView({ match, roster, coaches, existingNames, onCancel, onSave, onDelete }) {
   const isNew = !match;
   const [name, setName] = useState(match?.name || '');
   const [opponent, setOpponent] = useState(match?.opponent || '');
+  const [kickoffInput, setKickoffInput] = useState(formatKickoffForInput(match?.kickoffAt));
+  const [venue, setVenue] = useState(match?.venue || '');
   const [format, setFormat] = useState(match?.format || '7v7');
   const [formationName, setFormationName] = useState(match?.formationName || FORMATS[match?.format || '7v7'].formations[0].name);
   const [halfMinutes, setHalfMinutes] = useState(match?.halfMinutes || FORMATS[match?.format || '7v7'].halfMinutes);
@@ -1083,6 +1327,11 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
     if (match) return match.squad;
     // For new match: include the entire roster by default
     return roster.map(p => p.id);
+  });
+  const [matchCoaches, setMatchCoaches] = useState(() => {
+    if (match) return match.coaches || [];
+    // For new match: include all current coaches by default
+    return coaches.map(c => c.id);
   });
 
   // When format changes, sync formation/halfMinutes to that format's defaults
@@ -1101,6 +1350,12 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
   };
   const selectAll = () => setSquad(roster.map(p => p.id));
   const clearAll = () => setSquad([]);
+
+  const sortedCoaches = [...coaches].sort((a, b) => a.name.localeCompare(b.name, 'sv'));
+  const coachSet = new Set(matchCoaches);
+  const toggleCoach = (id) => {
+    setMatchCoaches(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  };
 
   // Generate placeholder name for new match
   const placeholderName = useMemo(() => {
@@ -1144,6 +1399,47 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
             value={opponent}
             onChange={e => setOpponent(e.target.value)}
             placeholder="t.ex. Hammarby"
+            className="w-full px-3 py-2.5 rounded-lg outline-none"
+            style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+          />
+        </div>
+      </div>
+
+      {/* Kickoff time + venue */}
+      <div className="rounded-2xl p-4 mb-3 space-y-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <div>
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-1.5" style={{ color: 'var(--ink-faint)' }}>Datum & avspark (valfritt)</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="datetime-local"
+              value={kickoffInput}
+              onChange={e => setKickoffInput(e.target.value)}
+              className="flex-1 px-3 py-2.5 rounded-lg outline-none"
+              style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+            />
+            {kickoffInput && (
+              <button
+                onClick={() => setKickoffInput('')}
+                className="px-3 py-2.5 rounded-lg text-xs font-semibold"
+                style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}
+                aria-label="Rensa tid"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+          {kickoffInput && (
+            <div className="text-[11px] mt-1" style={{ color: 'var(--ink-faint)' }}>
+              {formatKickoff(parseKickoffFromInput(kickoffInput)) || ''}
+            </div>
+          )}
+        </div>
+        <div>
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold block mb-1.5" style={{ color: 'var(--ink-faint)' }}>Plan / arena (valfritt)</label>
+          <input
+            value={venue}
+            onChange={e => setVenue(e.target.value)}
+            placeholder="t.ex. Plan 3, Hovet IP"
             className="w-full px-3 py-2.5 rounded-lg outline-none"
             style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
           />
@@ -1290,6 +1586,64 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
         )}
       </div>
 
+      {/* Coach picker */}
+      <div className="rounded-2xl p-4 mb-3" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+        <div className="flex items-center justify-between mb-2">
+          <label className="text-[10px] uppercase tracking-[0.2em] font-bold" style={{ color: 'var(--ink-faint)' }}>
+            Tränare ({matchCoaches.length}/{coaches.length})
+          </label>
+          {coaches.length > 0 && (
+            <div className="flex gap-1">
+              <button onClick={() => setMatchCoaches(coaches.map(c => c.id))} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>
+                Alla
+              </button>
+              <button onClick={() => setMatchCoaches([])} className="text-[11px] font-semibold px-2 py-1 rounded" style={{ color: 'var(--ink-muted)' }}>
+                Rensa
+              </button>
+            </div>
+          )}
+        </div>
+
+        {sortedCoaches.length === 0 ? (
+          <div className="text-xs text-center py-4" style={{ color: 'var(--ink-muted)' }}>
+            Lägg till tränare under "Trupp" först
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {sortedCoaches.map(c => {
+              const inMatch = coachSet.has(c.id);
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => toggleCoach(c.id)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left"
+                  style={{
+                    background: inMatch ? 'var(--accent-soft)' : 'white',
+                    border: `1.5px solid ${inMatch ? 'var(--accent)' : 'var(--border)'}`,
+                  }}
+                >
+                  <div className="flex items-center justify-center rounded shrink-0" style={{
+                    width: 22, height: 22,
+                    background: inMatch ? 'var(--accent)' : 'transparent',
+                    border: inMatch ? 'none' : '1.5px solid var(--border-strong)',
+                  }}>
+                    {inMatch && <Check size={14} style={{ color: 'white' }} />}
+                  </div>
+                  <span className="text-sm font-semibold flex-1 truncate" style={{ color: 'var(--ink)' }}>
+                    {c.name}
+                  </span>
+                  {c.role && (
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>
+                      {c.role}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* Actions */}
       <div className="flex gap-2 mt-5">
         {onDelete && (
@@ -1313,10 +1667,13 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
           onClick={() => onSave({
             name: name.trim() || placeholderName,
             opponent: opponent.trim(),
+            kickoffAt: parseKickoffFromInput(kickoffInput),
+            venue: venue.trim(),
             format,
             formationName,
             halfMinutes,
             squad,
+            coaches: matchCoaches,
           })}
           className="flex-1 py-3 rounded-xl text-sm font-bold disabled:opacity-30"
           style={{ background: 'var(--accent)', color: 'white' }}
@@ -1333,7 +1690,7 @@ function MatchSetupView({ match, roster, existingNames, onCancel, onSave, onDele
 // ===================================================================
 
 function MatchView({
-  settings, match, roster, playerById, selectedPlayerId,
+  settings, match, roster, playerById, coachById, selectedPlayerId,
   onSelectPlayer, onTapEmpty,
   onToggleClock, onAdjustClock, onNextHalf,
   onOpenFormatPicker, onOpenGoal, onOpenCard, onUndo, onAskReset,
@@ -1342,8 +1699,15 @@ function MatchView({
   const formatDef = FORMATS[match.format];
   const formation = getFormation(match.format, match.formationName);
   const halfTotal = match.halfMinutes * 60;
-  const overtime = match.clockSeconds > halfTotal;
+  // Live values — recomputed on every render (the parent forces re-render every second).
+  const liveClock = getLiveClockSeconds(match);
+  const livePlayingTime = getLivePlayingTime(match);
+  const overtime = liveClock > halfTotal;
   const opponentLabel = match.opponent || settings.awayTeam;
+  const kickoff = formatKickoff(match.kickoffAt);
+  const matchCoaches = (match.coaches || [])
+    .map(id => coachById?.get(id))
+    .filter(Boolean);
 
   return (
     <div className="px-4 pt-5">
@@ -1365,6 +1729,24 @@ function MatchView({
           <Edit2 size={14} />
         </button>
       </div>
+
+      {/* Match info: kickoff, venue, coaches */}
+      {(kickoff || match.venue || matchCoaches.length > 0) && (
+        <div className="rounded-xl px-3 py-2 mb-3 space-y-1" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+          {(kickoff || match.venue) && (
+            <div className="flex items-center gap-1.5 text-[12px] font-semibold" style={{ color: 'var(--ink)' }}>
+              {kickoff && <><Clock size={12} style={{ color: 'var(--ink-muted)' }} /><span>{kickoff}</span></>}
+              {kickoff && match.venue && <span style={{ color: 'var(--ink-faint)' }}>·</span>}
+              {match.venue && <span className="truncate">{match.venue}</span>}
+            </div>
+          )}
+          {matchCoaches.length > 0 && (
+            <div className="text-[11px] truncate" style={{ color: 'var(--ink-muted)' }}>
+              <span style={{ color: 'var(--ink-faint)' }}>Tränare:</span> {matchCoaches.map(c => c.name).join(', ')}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Top row: format + undo */}
       <div className="flex items-center gap-2 mb-3">
@@ -1404,7 +1786,7 @@ function MatchView({
               Halvlek {match.half}
             </div>
             <div className={`display tabular text-2xl font-bold ${match.clockRunning ? '' : 'opacity-70'}`} style={{ color: overtime ? 'var(--accent)' : 'var(--ink)' }}>
-              {formatClock(match.clockSeconds)}
+              {formatClock(liveClock)}
             </div>
             <div className="text-[9px] mt-0.5 tabular" style={{ color: 'var(--ink-faint)' }}>
               / {match.halfMinutes}:00
@@ -1455,7 +1837,7 @@ function MatchView({
         formation={formation}
         lineup={match.lineup}
         playerById={playerById}
-        playingTime={match.playingTime}
+        playingTime={livePlayingTime}
         selectedPlayerId={selectedPlayerId}
         onSelectPlayer={onSelectPlayer}
         onTapEmpty={onTapEmpty}
@@ -1465,7 +1847,7 @@ function MatchView({
       <Bench
         bench={match.bench}
         playerById={playerById}
-        playingTime={match.playingTime}
+        playingTime={livePlayingTime}
         selectedPlayerId={selectedPlayerId}
         onSelectPlayer={onSelectPlayer}
         squadSize={match.squad.length}
@@ -1814,13 +2196,17 @@ function StatsView({ match, roster, settings, playerStats, playerById }) {
   // Only include players in the squad for this match's stats
   const squadPlayers = roster.filter(p => squadSet.has(p.id));
 
+  // Live values — match clock + per-player playing time accruing in real-time.
+  const liveClock = getLiveClockSeconds(match);
+  const livePlayingTime = getLivePlayingTime(match);
+
   const playerData = useMemo(() => {
     return squadPlayers.map(p => ({
       ...p,
-      seconds: match.playingTime[p.id] || 0,
+      seconds: livePlayingTime[p.id] || 0,
       onField: onField.has(p.id),
     })).sort((a, b) => b.seconds - a.seconds);
-  }, [squadPlayers, match.playingTime, match.lineup]);
+  }, [squadPlayers, livePlayingTime, match.lineup]);
 
   const totals = useMemo(() => {
     const list = playerData.map(p => p.seconds);
@@ -1858,7 +2244,7 @@ function StatsView({ match, roster, settings, playerStats, playerById }) {
           </div>
           <div className="text-center px-3" style={{ color: 'var(--ink-faint)' }}>
             <div className="text-xs">Halvlek {match.half}</div>
-            <div className="display tabular text-sm font-bold mt-1">{formatClock(match.clockSeconds)}</div>
+            <div className="display tabular text-sm font-bold mt-1">{formatClock(liveClock)}</div>
           </div>
           <div className="text-center">
             <div className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--ink-muted)' }}>Borta</div>
@@ -1991,35 +2377,47 @@ function Stat({ label, value }) {
 // ROSTER VIEW
 // ===================================================================
 
-function RosterView({ roster, onAdd, onUpdate, onRemove }) {
+function RosterView({ roster, coaches, onAdd, onUpdate, onRemove, onAddCoach, onUpdateCoach, onRemoveCoach }) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState(null);
+  const [addingCoach, setAddingCoach] = useState(false);
+  const [editingCoachId, setEditingCoachId] = useState(null);
   const sorted = [...roster].sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
+  const sortedCoaches = [...coaches].sort((a, b) => a.name.localeCompare(b.name, 'sv'));
 
   return (
     <div className="px-4 pt-5">
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h1 className="display text-3xl font-bold">Trupp</h1>
-          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>{roster.length} spelare totalt</div>
+          <h1 className="display text-3xl font-bold">Trupp & stab</h1>
+          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+            {roster.length} spelare · {coaches.length} tränare
+          </div>
         </div>
-        <button
-          onClick={() => setAdding(true)}
-          className="px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-1.5"
-          style={{ background: 'var(--accent)', color: 'white' }}
-        >
-          <Plus size={16} /> Lägg till
-        </button>
       </div>
 
       <div className="text-xs mb-4 px-3 py-2 rounded-lg" style={{ background: 'var(--surface)', color: 'var(--ink-muted)', border: '1px solid var(--border)' }}>
-        Här är hela truppen. Välj <strong>vilka som spelar varje match</strong> under "Matcher".
+        Här är hela laguppställningen. Välj <strong>vilka som är med varje match</strong> under "Matcher".
+      </div>
+
+      {/* Players section */}
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[10px] uppercase tracking-[0.2em] font-bold" style={{ color: 'var(--ink-faint)' }}>
+          Spelare ({roster.length})
+        </div>
+        <button
+          onClick={() => setAdding(true)}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          <Plus size={12} /> Spelare
+        </button>
       </div>
 
       {roster.length === 0 && !adding && (
-        <div className="rounded-2xl p-8 text-center" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
-          <Users size={28} className="mx-auto mb-3" style={{ color: 'var(--ink-faint)' }} />
-          <div className="text-sm font-semibold mb-1">Truppen är tom</div>
+        <div className="rounded-2xl p-6 text-center mb-4" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
+          <Users size={24} className="mx-auto mb-2" style={{ color: 'var(--ink-faint)' }} />
+          <div className="text-sm font-semibold mb-1">Inga spelare ännu</div>
           <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
             Lägg till spelare innan du sätter ihop en match
           </div>
@@ -2030,7 +2428,7 @@ function RosterView({ roster, onAdd, onUpdate, onRemove }) {
         <PlayerForm onCancel={() => setAdding(false)} onSave={(p) => { onAdd(p); setAdding(false); }} />
       )}
 
-      <div className="space-y-2 mt-3">
+      <div className="space-y-2 mb-6">
         {sorted.map(p => (
           editingId === p.id ? (
             <PlayerForm
@@ -2059,6 +2457,116 @@ function RosterView({ roster, onAdd, onUpdate, onRemove }) {
             </div>
           )
         ))}
+      </div>
+
+      {/* Coaches section */}
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[10px] uppercase tracking-[0.2em] font-bold" style={{ color: 'var(--ink-faint)' }}>
+          Tränare & stab ({coaches.length})
+        </div>
+        <button
+          onClick={() => setAddingCoach(true)}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          <Plus size={12} /> Tränare
+        </button>
+      </div>
+
+      {coaches.length === 0 && !addingCoach && (
+        <div className="rounded-2xl p-6 text-center" style={{ background: 'var(--surface)', border: '1px dashed var(--border-strong)' }}>
+          <Users size={24} className="mx-auto mb-2" style={{ color: 'var(--ink-faint)' }} />
+          <div className="text-sm font-semibold mb-1">Inga tränare ännu</div>
+          <div className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+            Lägg till dig själv och eventuella assisterande
+          </div>
+        </div>
+      )}
+
+      {addingCoach && (
+        <CoachForm onCancel={() => setAddingCoach(false)} onSave={(c) => { onAddCoach(c); setAddingCoach(false); }} />
+      )}
+
+      <div className="space-y-2">
+        {sortedCoaches.map(c => (
+          editingCoachId === c.id ? (
+            <CoachForm
+              key={c.id} initial={c}
+              onCancel={() => setEditingCoachId(null)}
+              onSave={(updates) => { onUpdateCoach(c.id, updates); setEditingCoachId(null); }}
+              onRemove={() => { onRemoveCoach(c.id); setEditingCoachId(null); }}
+            />
+          ) : (
+            <div key={c.id} className="flex items-center gap-3 rounded-xl p-3"
+              style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
+              <div className="rounded-full flex items-center justify-center display font-bold shrink-0" style={{
+                width: 36, height: 36, background: 'var(--ink)', color: 'var(--bg)', fontSize: 14,
+              }}>
+                {initials(c.name)}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-semibold truncate">{c.name}</div>
+                {c.role && (
+                  <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--ink-faint)' }}>
+                    {c.role}
+                  </div>
+                )}
+              </div>
+              <button onClick={() => setEditingCoachId(c.id)} className="p-2" style={{ color: 'var(--ink-muted)' }} aria-label="Redigera">
+                <Edit2 size={14} />
+              </button>
+            </div>
+          )
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CoachForm({ initial, onSave, onCancel, onRemove }) {
+  const [name, setName] = useState(initial?.name || '');
+  const [role, setRole] = useState(initial?.role || '');
+  const canSave = name.trim().length > 0;
+
+  return (
+    <div className="rounded-2xl p-4 mb-2" style={{ background: 'var(--surface)', border: '1.5px solid var(--accent)' }}>
+      <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: 'var(--accent)' }}>
+        {initial ? 'Redigera tränare' : 'Ny tränare'}
+      </div>
+      <div className="space-y-2 mb-3">
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="Namn"
+          className="w-full px-3 py-2.5 rounded-lg outline-none"
+          style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+        />
+        <input
+          value={role}
+          onChange={e => setRole(e.target.value)}
+          placeholder="Roll (valfritt) — t.ex. Huvudtränare"
+          className="w-full px-3 py-2.5 rounded-lg outline-none"
+          style={{ background: 'white', border: '1px solid var(--border)', color: 'var(--ink)' }}
+        />
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-lg text-sm font-semibold"
+          style={{ border: '1px solid var(--border-strong)', color: 'var(--ink-muted)' }}>
+          Avbryt
+        </button>
+        {onRemove && (
+          <button onClick={onRemove} className="px-3 py-2.5 rounded-lg" style={{ border: '1px solid rgba(220, 38, 38, 0.4)', color: '#dc2626' }} aria-label="Ta bort">
+            <Trash2 size={14} />
+          </button>
+        )}
+        <button
+          disabled={!canSave}
+          onClick={() => onSave({ name: name.trim(), role: role.trim() })}
+          className="flex-1 py-2.5 rounded-lg text-sm font-bold disabled:opacity-30"
+          style={{ background: 'var(--accent)', color: 'white' }}
+        >
+          Spara
+        </button>
       </div>
     </div>
   );
@@ -2176,8 +2684,8 @@ function SettingsView({ settings, onChange, onAskReset, hasActiveMatch }) {
       )}
 
       <div className="text-center text-[10px] mt-8 leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
-        Knatte Coach · v0.2<br/>
-        Multipla matcher + namn på brickor
+        Knatte Coach · v0.4<br/>
+        Tränare, matchtid och plan
       </div>
     </div>
   );
